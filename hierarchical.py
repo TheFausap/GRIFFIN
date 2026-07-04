@@ -43,12 +43,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from griffin_cglru import (GriffinConfig, ResidualBlock, RecurrentBlock,
+from griffin_cglru import (Griffin, GriffinConfig, ResidualBlock, RecurrentBlock,
                            LocalMQA, RMSNorm)
 from patcher import PatcherConfig, PatchEncoder, PatchDecoder
 
 from dynamic import (load_boundary_mask, block_split_with_mask,
-                     build_ragged, forward_ragged)
+                     build_ragged, forward_ragged, cap_patch_lengths)
+from eval_hook import load_flat_model, flat_first_within
 
 # --------------------------------------------------------------------------- #
 # Config
@@ -233,6 +234,12 @@ def main():
                    help="path to boundaries.npz -> dynamic entropy patching; empty = fixed")
     p.add_argument("--ckpt_tag", default="",
                    help="checkpoint suffix, e.g. _dyn (keeps the fixed best.pt safe)")
+    p.add_argument("--entropy_ckpt", default="",
+                   help="frozen flat byte model (e.g. entropy_model/best.pt); if set, eval "
+                        "also scores it first/within on the SAME boundaries as this run -- "
+                        "the real dynamic mask when --boundaries is set (the tax gate), or "
+                        "a synthetic stride-patch_len mask when running fixed (the fixed "
+                        "first/within baseline) -- so both land in one eval.")
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -279,6 +286,12 @@ def main():
     print(f"params={model.num_params()/1e6:.2f}M  (global runs over {args.patches} patches, "
           f"~{args.patch_len}x shorter than {S} bytes)\n")
 
+    flat = None
+    if args.entropy_ckpt:
+        flat = load_flat_model(args.entropy_ckpt, device, lambda c: Griffin(c))
+        print(f"loaded frozen flat model {args.entropy_ckpt} for first/within tax comparison "
+              f"({'real dynamic mask' if DYN else f'synthetic stride-{args.patch_len} mask'})\n")
+
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
                             betas=(0.9, 0.95), weight_decay=args.weight_decay)
 
@@ -300,6 +313,7 @@ def main():
     def eval_loss():
         model.eval()
         tot = first = within = mlen = 0.0
+        ff_bits = ff_n = fw_bits = fw_n = 0.0    # flat model's first/within, bits (same boundaries)
         for _ in range(20):                      # bump to ~50 for the real comparison
             if DYN:
                 x, m = get_batch(val, val_m)
@@ -307,11 +321,31 @@ def main():
                 l, aux = forward_ragged(model, p_, pl_, pm_, bm_)
                 first += aux["loss_first"].item(); within += aux["loss_within"].item()
                 mlen += aux["mean_patch_len"].item()
+                if flat is not None:
+                    # exactly the mask build_ragged used internally (forced start + Lcap
+                    # splits) -- the real boundaries hier's own first/within were scored on.
+                    adj_m = m.clone(); adj_m[:, 0] = True
+                    adj_m = cap_patch_lengths(adj_m, Lcap=32)
+                    r = flat_first_within(flat, x, adj_m)
             else:
-                _, l = model(get_batch(val))
+                x = get_batch(val)
+                _, l = model(x)
+                if flat is not None:
+                    L = args.patch_len
+                    first_tgt = torch.zeros_like(x, dtype=torch.bool)
+                    first_tgt[:, ::L] = True         # synthetic fixed-stride mask (step 2)
+                    r = flat_first_within(flat, x, first_tgt)
+            if flat is not None:
+                ff_bits += r["first_bits"]; ff_n += r["first_n"]
+                fw_bits += r["within_bits"]; fw_n += r["within_n"]
             tot += l.item()
         model.train()
-        return (tot/20, first/20, within/20, mlen/20)
+        out = {"val": tot/20, "hier_first": first/20, "hier_within": within/20,
+               "mean_patch_len": mlen/20}
+        if flat is not None:
+            out["flat_first"] = ff_bits / max(ff_n, 1)
+            out["flat_within"] = fw_bits / max(fw_n, 1)
+        return out
 
     best_val = float("inf")
     start_step = 0
@@ -373,12 +407,21 @@ def main():
         opt.step()
 
         if step % args.eval_interval == 0 or step == args.steps - 1:
-            v, vf, vw, ml = eval_loss()
+            m = eval_loss()
+            v = m["val"]
             bpb = v / ln2; bpc = bpb * bytes_per_char
             flag = ""
             if v < best_val:
                 best_val = v; save_ckpt(f"best{args.ckpt_tag}.pt", step); flag = "  <- best (saved)"
-            extra = f" | first {vf/ln2:.3f} within {vw/ln2:.3f} b/byte | len {ml:.2f}" if DYN else ""
+            extra = ""
+            if DYN:
+                vf, vw = m["hier_first"] / ln2, m["hier_within"] / ln2
+                extra = f" | hier first {vf:.3f} within {vw:.3f} b/byte | len {m['mean_patch_len']:.2f}"
+            if "flat_first" in m:
+                ff, fw = m["flat_first"], m["flat_within"]
+                extra += f" | flat first {ff:.3f} within {fw:.3f}"
+                if DYN:
+                    extra += f" | tax first {vf - ff:+.3f} within {vw - fw:+.3f}"
             print(f"step {step:4d} | lr {lr_at(step):.2e} | train {loss.item():.3f} "
                   f"| val {v:.3f} | bits/byte {bpb:.3f} | BPC {bpc:.3f}{flag}{extra}")
 

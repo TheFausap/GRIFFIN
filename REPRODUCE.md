@@ -165,14 +165,19 @@ Read:
 **Pass criterion:** boundaries track onsets; top surprises are word-initial
 bytes. If instead they're junk, fix/retrain the entropy model before proceeding.
 
-### 5.4 First/within tax measurement (`eval_hook.py` + patch)
+### 5.4 First/within tax measurement (`eval_hook.py`, wired into `hierarchical.py`)
 
-Apply the eval-hook wiring so the trainer reports, every eval, the hierarchical
-first/within **and** the frozen flat model's first/within on the *same* batches:
+`hierarchical.py` already imports `eval_hook` and accepts `--entropy_ckpt`. Pass
+a frozen flat checkpoint and every eval reports the hierarchical first/within
+**and** the frozen flat model's first/within on the *same* boundaries:
 
 ```bash
-cp eval_hook.py <repo root>
-git apply hierarchical_eval_hook.patch     # adds --entropy_ckpt + decomposition
+# dynamic run -- flat is scored on the REAL boundary mask (the tax gate)
+python hierarchical.py --file corpus/<book>.txt --patch_len 6 --patches 32 \
+    --boundaries boundaries.npz --steps <N> --entropy_ckpt entropy_model/best.pt
+
+# fixed run -- flat is scored on a synthetic stride-patch_len mask
+# (the fixed-stride first/within baseline, for a like-for-like comparison)
 python hierarchical.py --file corpus/<book>.txt --patch_len 6 --patches 32 \
     --steps <N> --entropy_ckpt entropy_model/best.pt
 ```
@@ -180,8 +185,11 @@ python hierarchical.py --file corpus/<book>.txt --patch_len 6 --patches 32 \
 New per-eval line:
 
 ```
-… | hier first F within W | flat first f within w | tax first (F−f) within (W−w)
+… | hier first F within W b/byte | len L | flat first f within w | tax first (F−f) within (W−w)
 ```
+
+(the fixed run has no boundary mask to score hier's own first/within against, so
+it prints only `flat first/within` -- that's the fixed-stride baseline itself.)
 
 Interpretation:
 - `flat first/within` are the **full-context reference floors**.
@@ -190,8 +198,10 @@ Interpretation:
   the decoder is leaking on *easy* bytes (it sees prior patches only through the
   single summary vector, never their raw bytes), and the fix is real cross-patch
   byte context, not a boundary tweak.
-- On fixed boundaries this is exactly the **fixed-stride first/within baseline**
-  you need to compare dynamic against.
+- Compare the dynamic run's `hier within` against the fixed run's `flat within`
+  (both on stride/boundary-scored full-context floors) for the like-for-like
+  dynamic-vs-fixed within comparison -- this is the piece that was never
+  measured before.
 
 > Caveat: read the tax as a *floor*. The entropy/flat model is deliberately
 > undertrained (overstates surprise) and short-window batches start cold; a
