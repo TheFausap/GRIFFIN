@@ -141,6 +141,27 @@ def main():
     print(f"boundaries      : {n_bnd}  ->  mean patch length {mean_patch:.2f} tokens "
           f"(latent sequence ~{mean_patch:.1f}x shorter)\n")
 
+    # --- first-vs-within decomposition, two DIFFERENT signals -----------------
+    # boundary at j => token j opens a patch; index the length-(T-1) arrays with j-1.
+    first_idx  = [j - 1 for j in range(1, T) if boundary[j]]
+    within_idx = [j - 1 for j in range(1, T) if not boundary[j]]
+    fi = torch.tensor(first_idx,  dtype=torch.long)
+    wi = torch.tensor(within_idx, dtype=torch.long)
+
+    # (1) predictive ENTROPY = self-uncertainty -> the boundary POLICY signal.
+    ent_first  = ent_np[fi].mean().item() if first_idx  else float("nan")
+    ent_within = ent_np[wi].mean().item() if within_idx else float("nan")
+
+    # (2) realized NLL of the TRUE next byte = bits/byte -> the TAX signal,
+    #     like-for-like against the hierarchical first/within losses.
+    tgt = torch.tensor(ids[1:], dtype=torch.long, device=logp.device)
+    nll = (-logp[torch.arange(tgt.numel(), device=logp.device), tgt] / LN2).cpu()  # [T-1] bits
+    nll_first  = nll[fi].mean().item() if first_idx  else float("nan")
+    nll_within = nll[wi].mean().item() if within_idx else float("nan")
+
+    print(f"entropy (policy)    : first {ent_first:.3f} | within {ent_within:.3f} bits  (self-uncertainty)")
+    print(f"NLL (tax, bits/byte): first {nll_first:.3f} | within {nll_within:.3f} bits  (vs hier ~3.94 / ~1.565)")
+
     # --- dump bytes + boundaries for the patcher (fixed-boundaries interface) ---
     if args.dump:
         starts = [0] + [j for j in range(1, T) if boundary[j]]
@@ -153,6 +174,8 @@ def main():
                 "ids": ids,
                 "patch_starts": starts,     # patch k = ids[starts[k] : starts[k]+lengths[k]]
                 "patch_lengths": lengths,
+                "ent_first": ent_first,
+                "ent_within": ent_within,
             }, f)
         print(f"dumped {len(starts)} patches over {T} tokens -> {args.dump}\n")
 
