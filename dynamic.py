@@ -91,10 +91,29 @@ def block_split_with_mask(data, mask, block, val_every):
 # --------------------------------------------------------------------------- #
 # ragged batch builder:  (bytes, boundary-mask) window batch -> padded patches
 # --------------------------------------------------------------------------- #
-def build_ragged(x, m):
+def cap_patch_lengths(m, Lcap):
+    """Split any patch longer than Lcap into Lcap-sized pieces.
+
+    We insert a boundary at every Lcap-th byte MEASURED FROM THE LAST ORIGINAL
+    boundary (rel % Lcap == 0), not wherever rel >= Lcap. The latter marks every
+    byte past the cap as a boundary (because `last` never advances to inserted
+    boundaries), shattering a long patch into 1-byte patches instead of capping
+    it. Modulo from the gap start spaces the cuts exactly Lcap apart, so every
+    resulting patch has length <= Lcap.
+    """
+    B, S = m.shape
+    m = m.clone(); m[:, 0] = True
+    pos = torch.arange(S, device=m.device).unsqueeze(0).expand(B, S)
+    last = torch.cummax(torch.where(m, pos, torch.zeros_like(pos)), dim=1).values
+    rel = pos - last
+    return m | ((rel > 0) & (rel % Lcap == 0))
+
+
+def build_ragged(x, m, Lcap=32):
     """
     x : [B, S] long byte ids for the sampled windows
     m : [B, S] bool boundary mask aligned to x (True = a patch starts here)
+    Lcap : force a boundary at least every Lcap bytes (bounds Lmax -> bounds memory)
 
     Returns:
       patches : [B, Pmax, Lmax] long   (padded byte ids per patch)
@@ -107,6 +126,8 @@ def build_ragged(x, m):
     device = x.device
     m = m.clone()
     m[:, 0] = True                                  # force a patch start at window pos 0
+    if Lcap:
+        m = cap_patch_lengths(m, Lcap)              # bound longest patch -> bound memory
 
     pid = torch.cumsum(m.long(), dim=1) - 1         # [B,S] patch index owning each position
     P_b = pid[:, -1] + 1                            # [B] number of patches per window
