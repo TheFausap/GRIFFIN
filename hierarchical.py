@@ -45,7 +45,7 @@ import torch.nn.functional as F
 
 from griffin_cglru import (Griffin, GriffinConfig, ResidualBlock, RecurrentBlock,
                            LocalMQA, RMSNorm)
-from patcher import PatcherConfig, PatchEncoder, PatchDecoder
+from patcher import PatcherConfig, PatchEncoder, PatchDecoder, prev_patch_tail
 
 from dynamic import (load_boundary_mask, block_split_with_mask,
                      build_ragged, forward_ragged, cap_patch_lengths)
@@ -72,6 +72,7 @@ class HierConfig:
     d_dec: int = 256
     encoder: str = "gru"
     dec_layers: int = 1
+    byte_ctx_len: int = 8    # trailing raw bytes of the previous patch fed to the decoder
 
     def griffin(self):
         return GriffinConfig(
@@ -83,7 +84,8 @@ class HierConfig:
     def patcher(self):
         return PatcherConfig(
             vocab_size=self.vocab_size, d_model=self.d_model, d_byte=self.d_byte,
-            encoder=self.encoder, d_dec=self.d_dec, dec_layers=self.dec_layers)
+            encoder=self.encoder, d_dec=self.d_dec, dec_layers=self.dec_layers,
+            byte_ctx_len=self.byte_ctx_len)
 
 
 # --------------------------------------------------------------------------- #
@@ -149,9 +151,13 @@ class HierByteLM(nn.Module):
         # condition for patch k = context through patch k-1 (start vector for k=0)
         cond = torch.cat([self.start.expand(B, 1, -1), c[:, :-1]], dim=1)   # [B, P, d]
 
+        plens = torch.full((B, P), L, dtype=torch.long, device=tokens.device)
+        prev_ctx = prev_patch_tail(patches, plens, self.cfg.byte_ctx_len,
+                                    self.decoder.BOS).reshape(B * P, self.cfg.byte_ctx_len)
+
         z = cond.reshape(B * P, self.cfg.d_model)
         tgt = patches.reshape(B * P, L)
-        logits = self.decoder(z, tgt).view(B, P, L, self.cfg.vocab_size)
+        logits = self.decoder(z, tgt, prev_ctx).view(B, P, L, self.cfg.vocab_size)
         loss = F.cross_entropy(logits.reshape(-1, self.cfg.vocab_size), tokens.reshape(-1))
         return logits, loss
 
@@ -159,6 +165,8 @@ class HierByteLM(nn.Module):
     def generate(self, n_patches, device, prompt=b"", temperature=1.0):
         """Autonomous generation: emit n_patches new patches of L bytes each."""
         L = self.cfg.patch_len
+        K = self.cfg.byte_ctx_len
+        pad_id = self.decoder.BOS
         # seed bytes (truncate prompt to a whole number of patches)
         seed = list(prompt)[: (len(prompt) // L) * L]
         out = list(seed)
@@ -170,9 +178,13 @@ class HierByteLM(nn.Module):
                 e = self._encode_patches(patches)
                 c = self.global_model(e)
                 cond = c[:, -1]                        # context through last patch
+                last_patch = out[-L:]                  # the just-completed patch
             else:
                 cond = self.start[:, 0]                # [1, d]
-            gen = self.decoder.generate(cond, torch.tensor([L], device=device))  # [1, L]
+                last_patch = []                         # no previous patch yet
+            ctx = [pad_id] * max(0, K - len(last_patch)) + last_patch[-K:]
+            prev_ctx = torch.tensor([ctx], dtype=torch.long, device=device)
+            gen = self.decoder.generate(cond, torch.tensor([L], device=device), prev_ctx)  # [1,L]
             out.extend(int(b) for b in gen[0].tolist())
         return bytes(b & 0xFF for b in out)
 
@@ -329,9 +341,15 @@ def main():
                     r = flat_first_within(flat, x, adj_m)
             else:
                 x = get_batch(val)
-                _, l = model(x)
+                logits, l = model(x)
+                L = args.patch_len
+                B_, P_, Lp_, V_ = logits.shape
+                tgt = x.view(B_, P_, L)
+                ce = F.cross_entropy(logits.reshape(-1, V_), tgt.reshape(-1),
+                                     reduction="none").view(B_, P_, Lp_)
+                first += ce[:, :, 0].mean().item()
+                within += ce[:, :, 1:].mean().item()
                 if flat is not None:
-                    L = args.patch_len
                     first_tgt = torch.zeros_like(x, dtype=torch.bool)
                     first_tgt[:, ::L] = True         # synthetic fixed-stride mask (step 2)
                     r = flat_first_within(flat, x, first_tgt)
@@ -413,15 +431,13 @@ def main():
             flag = ""
             if v < best_val:
                 best_val = v; save_ckpt(f"best{args.ckpt_tag}.pt", step); flag = "  <- best (saved)"
-            extra = ""
-            if DYN:
-                vf, vw = m["hier_first"] / ln2, m["hier_within"] / ln2
-                extra = f" | hier first {vf:.3f} within {vw:.3f} b/byte | len {m['mean_patch_len']:.2f}"
+            vf, vw = m["hier_first"] / ln2, m["hier_within"] / ln2
+            extra = f" | hier first {vf:.3f} within {vw:.3f} b/byte"
+            extra += f" | len {m['mean_patch_len']:.2f}" if DYN else f" | len {args.patch_len} (fixed)"
             if "flat_first" in m:
                 ff, fw = m["flat_first"], m["flat_within"]
                 extra += f" | flat first {ff:.3f} within {fw:.3f}"
-                if DYN:
-                    extra += f" | tax first {vf - ff:+.3f} within {vw - fw:+.3f}"
+                extra += f" | tax first {vf - ff:+.3f} within {vw - fw:+.3f}"
             print(f"step {step:4d} | lr {lr_at(step):.2e} | train {loss.item():.3f} "
                   f"| val {v:.3f} | bits/byte {bpb:.3f} | BPC {bpc:.3f}{flag}{extra}")
 

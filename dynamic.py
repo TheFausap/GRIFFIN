@@ -32,6 +32,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from patcher import prev_patch_tail
+
 
 # --------------------------------------------------------------------------- #
 # Mask I/O + alignment guard
@@ -170,9 +172,12 @@ def forward_ragged(model, patches, plens, pmask, bmask):
     c = model.global_model(e)                               # causal over patches
     cond = torch.cat([model.start.expand(B, 1, -1), c[:, :-1]], dim=1)   # c through k-1
 
+    K = model.cfg.byte_ctx_len
+    prev_ctx = prev_patch_tail(patches, plens, K, model.decoder.BOS).reshape(B * Pmax, K)
+
     z = cond.reshape(B * Pmax, d)
     tgt = patches.reshape(B * Pmax, Lmax)
-    logits = model.decoder(z, tgt).view(B, Pmax, Lmax, V)
+    logits = model.decoder(z, tgt, prev_ctx).view(B, Pmax, Lmax, V)
 
     ce = F.cross_entropy(logits.reshape(-1, V), tgt.reshape(-1),
                          reduction="none").view(B, Pmax, Lmax)

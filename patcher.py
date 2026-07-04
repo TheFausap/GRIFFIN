@@ -47,6 +47,9 @@ class PatcherConfig:
     # decoder (autoregressive byte generator conditioned on a patch vector)
     d_dec: int = 256          # decoder GRU hidden size
     dec_layers: int = 1
+    # cross-patch byte context: trailing raw bytes of the PREVIOUS patch, fed
+    # to the decoder alongside the summary vector z (see prev_patch_tail below)
+    byte_ctx_len: int = 8
 
 
 # --------------------------------------------------------------------------- #
@@ -133,6 +136,39 @@ class PatchEncoder(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
+# Cross-patch byte context: the previous patch's trailing raw bytes
+# --------------------------------------------------------------------------- #
+def prev_patch_tail(patches, plens, K, pad_id):
+    """
+    patches : [B, P, Lmax] long byte ids (real bytes at [..., :plens[b,k]]).
+    plens   : [B, P] long, true length of each patch (0 for a pad/absent patch).
+    K       : trailing-context window length.
+    pad_id  : sentinel id for "no byte here" -- pass PatchDecoder.BOS
+              (== vocab_size) so the decoder's existing embedding table covers
+              it with no new table.
+
+    Returns [B, P, K] long: the last min(K, plen) real bytes of the PREVIOUS
+    patch (index k-1), right-aligned and left-padded with pad_id. Patch 0 has
+    no previous patch and gets an all-pad_id window -- the same "nothing
+    before this" convention as the learned `start` vector for the global
+    context, so the two conditioning signals agree at a sequence's first patch.
+    """
+    B, P, Lmax = patches.shape
+    device = patches.device
+    prev_patches = torch.cat(
+        [torch.full((B, 1, Lmax), pad_id, dtype=torch.long, device=device), patches[:, :-1]],
+        dim=1)                                                     # [B, P, Lmax]
+    prev_plens = torch.cat(
+        [torch.zeros((B, 1), dtype=torch.long, device=device), plens[:, :-1]], dim=1)   # [B, P]
+
+    o = torch.arange(K, device=device).view(1, 1, K)
+    src = prev_plens.unsqueeze(-1) - K + o                          # [B, P, K], may be negative
+    valid = src >= 0
+    gathered = torch.gather(prev_patches, 2, src.clamp(min=0, max=Lmax - 1))
+    return torch.where(valid, gathered, torch.full_like(gathered, pad_id))
+
+
+# --------------------------------------------------------------------------- #
 # Patch decoder
 # --------------------------------------------------------------------------- #
 class PatchDecoder(nn.Module):
@@ -151,25 +187,42 @@ class PatchDecoder(nn.Module):
     def __init__(self, cfg: PatcherConfig):
         super().__init__()
         self.cfg = cfg
-        self.BOS = cfg.vocab_size                         # extra start-of-patch id
+        self.BOS = cfg.vocab_size                         # extra start-of-patch id (doubles as
+                                                            # the "no previous byte" pad sentinel)
         self.in_embed = nn.Embedding(cfg.vocab_size + 1, cfg.d_byte)
         self.cond = nn.Linear(cfg.d_model, cfg.d_dec * cfg.dec_layers)   # z -> h0
         self.gru = nn.GRU(cfg.d_byte + cfg.d_model, cfg.d_dec,
                           num_layers=cfg.dec_layers, batch_first=True)
         self.out = nn.Linear(cfg.d_dec, cfg.vocab_size)
+        # cross-patch byte context: raw trailing bytes of the previous patch,
+        # embedded with the same table as the decoder's own input bytes and
+        # projected into the conditioning vector -- real byte evidence beyond
+        # the single summary vector z.
+        self.ctx_proj = nn.Linear(cfg.byte_ctx_len * cfg.d_byte, cfg.d_model)
         self.apply(PatchEncoder._init)
+
+    def _augment(self, z, prev_ctx):
+        if prev_ctx is None:
+            return z
+        P = prev_ctx.shape[0]
+        ctx = self.in_embed(prev_ctx).reshape(P, -1)      # [P, K*d_byte]
+        return z + self.ctx_proj(ctx)
 
     def _h0(self, z):
         P = z.shape[0]
         h = self.cond(z).view(P, self.cfg.dec_layers, self.cfg.d_dec)
         return h.transpose(0, 1).contiguous()             # [layers, P, d_dec]
 
-    def forward(self, z, tgt):
+    def forward(self, z, tgt, prev_ctx=None):
         """
-        z   : [P, d_model] patch vectors
-        tgt : [P, Lmax] padded target byte ids
+        z        : [P, d_model] patch vectors
+        tgt      : [P, Lmax] padded target byte ids
+        prev_ctx : [P, byte_ctx_len] long, trailing raw bytes of the PREVIOUS
+                   patch (see prev_patch_tail); None = no cross-patch context
+                   (backward-compatible with the single-vector conditioning).
         returns logits [P, Lmax, vocab] (teacher-forced; input is BOS + tgt[:-1])
         """
+        z = self._augment(z, prev_ctx)
         P, Lmax = tgt.shape
         bos = torch.full((P, 1), self.BOS, dtype=torch.long, device=tgt.device)
         inp = torch.cat([bos, tgt[:, :-1]], dim=1)        # shift-right
@@ -179,8 +232,9 @@ class PatchDecoder(nn.Module):
         return self.out(out)                              # [P, Lmax, vocab]
 
     @torch.no_grad()
-    def generate(self, z, lengths):
+    def generate(self, z, lengths, prev_ctx=None):
         """Greedy free-running reconstruction. z: [P,d_model]; lengths: [P]."""
+        z = self._augment(z, prev_ctx)
         P = z.shape[0]
         Lmax = int(torch.as_tensor(lengths).max())
         device = z.device

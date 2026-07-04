@@ -253,18 +253,24 @@ hand-picked slice) so `flat_within` vs `hier_within` is purely architectural.
 
 ---
 
-## 8. Findings so far (provisional)
+## 8. Findings so far
 
+Superseded by **`RESULTS_ANNEX.md`** — the numbers below were measured against
+`corpus.random/`, a differently-named copy of the same 53 files as `corpus/`;
+`dynamic.py`'s boundary-mask checksum guard caught the mismatch when both
+runs were redone against `corpus/` directly. See the annex for the corrected,
+matched head-to-head (fixed BPC 1.960 / dynamic BPC 1.987, within-tax
+confirmed real on full val data, not a slice artifact) and the finding this
+first pass missed: dynamic within-loss (1.560) beats fixed within-loss (1.980)
+like-for-like by 0.42 bits/byte — masked in aggregate BPC by the unavoidable
+cost of the entropy-selected first byte.
+
+Original (superseded) notes, kept for history:
 - Fixed baseline: BPC ≈ 1.606 (beats char anchor 1.74).
 - Dynamic (entropy) baseline, converged (LR at floor): BPC ≈ 1.94,
-  first ≈ 3.94 / within ≈ 1.565, len ≈ 6.4. So the ~0.33 BPC gap is real, not
-  undertraining.
+  first ≈ 3.94 / within ≈ 1.565, len ≈ 6.4.
 - Boundary gate passes at p85 (threshold ≈ 3.0 bits, len ≈ 6.6): onsets, mostly
-  whole-word patches.
+  whole-word patches. (This gate result held up in the corrected re-run too.)
 - On an in-distribution slice, the flat full-context model scores first ≈ 3.54 /
-  within ≈ 0.99. Decomposing the gap suggests the **within** bytes, not the
-  boundary bytes, carry most of the architectural tax — pointing at the decoder's
-  lack of cross-patch byte context rather than at the boundary policy.
-- **Unconfirmed:** that within-tax is measured on a small single-file slice
-  against an undertrained reference. Confirm on matched val (5.4) before acting
-  on it.
+  within ≈ 0.99 — pointed at the decoder's lack of cross-patch byte context, an
+  early read that the matched-data re-run in the annex confirmed.
