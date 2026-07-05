@@ -116,8 +116,31 @@ python analyze.py --ckpt entropy_model/best.pt --file corpus/<one_book>.txt \
 ```
 
 Boundaries should land on word/sentence onsets, and the highest-surprise
-positions should be word-initial bytes. If not, retrain the entropy model
-before going further.
+positions should be word-initial bytes. If they don't, check these in order
+— the first is by far the most common cause:
+
+1. **Wrong operating point, not a bad model.** Mean patch length is a pure
+   function of `--percentile`: `len = 100 / (100 - percentile)`. To match a
+   fixed baseline at `--patch_len 6` you need `len ≈ 6`, i.e. `--percentile`
+   around **84–85**, not the `analyze.py` default of 70 (`len ≈ 3.3`, which
+   will look badly over-fragmented even from a perfectly good entropy
+   model). Try the matching percentile before touching the model at all.
+2. **Boundaries look smooth / cut in arbitrary places → likely overtrained.**
+   Lower `--max_iters` and retrain. This isn't a guess: a controlled sweep
+   in this repo's own history (`RESULTS_ANNEX.md`) found mid-word
+   fragmentation rising monotonically from 10.6% at 200 steps to 15.6% at
+   8000 steps on the same corpus/preset — quality peaked early, then
+   degraded steadily with more training. If your run used more than a
+   couple thousand steps, that's the first thing to cut back.
+3. **Boundaries look noisy / don't track words at all → likely
+   undertrained or too small.** Raise `--max_iters` a bit, or move up a
+   size preset (`--size tiny` → `small` → `medium`) — capacity has to be
+   sufficient before "stop early" becomes the right lever; `entropy_model`
+   in this repo's own experiments used `--size small` (9 layers, 384-dim),
+   not `tiny`.
+
+Re-run step 2 after any change — it's cheap and it's the actual gate, not a
+one-time formality.
 
 ### 3. Train the fixed-stride baseline
 
@@ -170,6 +193,50 @@ python sample_hier.py --ckpt best_endo.pt   --prompt "The " --n 400 --temperatur
 Use `--temperature 0` for the old deterministic greedy behavior; greedy
 decoding tends to fall into repetition loops on a model this size, so
 sampling is recommended for anything meant to be read.
+
+## Scaling up
+
+Everything above runs at a deliberately small scale (~7M-parameter
+hierarchical model, `patches=32` × `patch_len=6` = 192 bytes of context per
+training window). If you want a bigger model or more context, here's
+exactly what's exposed and what isn't.
+
+**Global (hierarchical) model width/depth** — `--d_model` and `--depth` are
+both CLI flags. One constraint: `d_model` must be a multiple of `head_dim`
+(64 by default), so valid values are 128, 192, 256, 320, 384, ... A gap
+worth knowing: the global model's recurrent width (`d_rnn`, default 384) is
+**not** wired to a CLI flag and won't auto-scale with `--d_model` — the
+paper's own models keep `d_rnn ≈ 4/3 × d_model`, so if you push `d_model`
+well past 256 without also raising `d_rnn`, you're skewing that ratio. To
+change it, edit `HierConfig`'s `d_rnn` default directly in
+`hierarchical.py`.
+
+**More context** — raise `--patches` and/or `--patch_len` (the training
+window is `patches × patch_len` bytes). This used to hit an O(sequence²)
+memory wall in `LocalMQA`'s attention; that's fixed now (blockwise,
+O(sequence × window)), so pushing `--patches` well past 32 is far cheaper
+than it used to be. The window itself auto-tracks `--patches`
+(`window_size = max(16, patches)`), so you don't need to set it separately.
+
+**Boundary head capacity (Stage 2 only)** — `--boundary_d_model`,
+`--boundary_depth`, `--boundary_head_dim`, `--boundary_window` are all CLI
+flags, and this one's recurrent width *does* auto-scale (`d_rnn = 1.5 ×
+boundary_d_model`), so no manual edit needed there. Keep it modest relative
+to the main model, though — it runs a full forward+backward pass every
+single pre-freeze training step, on top of the main model's own step.
+
+**Entropy model / char anchor capacity** — controlled by `--size` in
+`train_verdict.py` (`tiny` / `small` / `medium`; see `PRESETS` in that file
+for the exact numbers), not raw `d_model`/`depth` flags.
+
+**Batch size and hardware** — `--batch_size` is the usual lever if you're
+VRAM-bound rather than compute-bound. Two practical notes from this repo's
+own history: this codebase has **no multi-GPU support** (no DDP, no model
+parallelism) — two GPUs today means two independent runs side by side, not
+double the VRAM for one run. And the lowest-effort path to a genuinely
+bigger model is a single bigger card (e.g. Colab) rather than squeezing
+scale out of 8 GB: nothing here assumes a specific device, so the same
+commands run unchanged, just with larger `--d_model`/`--depth`/`--patches`.
 
 ## Where to go next
 
