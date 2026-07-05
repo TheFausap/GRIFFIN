@@ -94,6 +94,16 @@ need much VRAM even at long context.
 Put some UTF-8 `.txt` files (e.g. a handful of Project Gutenberg books) in
 a `corpus/` directory, then:
 
+Steps 3, 4, and 5 below are three **independent** training runs, not a
+required sequence — each one only reads `corpus/` and (optionally, for
+steps 3 and 5) `entropy_model/best.pt`, and each writes to its own
+distinctly-tagged checkpoint. Run all three to reproduce the full
+comparison in `RESULTS_ANNEX.md`, or jump straight to whichever regime
+you actually want (e.g. step 1 → step 5, skipping 3 and 4 entirely, works
+fine) — step 4 is the only one of the three with an internal dependency of
+its own (it needs `entropy_model/best.pt` to generate `boundaries.npz`
+before it can train).
+
 ### 1. Train the byte-level entropy model
 
 This is the model that will place patch boundaries. Train it in its own
@@ -300,6 +310,43 @@ memory wall in `LocalMQA`'s attention; that's fixed now (blockwise,
 O(sequence × window)), so pushing `--patches` well past 32 is far cheaper
 than it used to be. The window itself auto-tracks `--patches`
 (`window_size = max(16, patches)`), so you don't need to set it separately.
+
+`--patches` is free to change on its own. `--patch_len` is not — it's the
+one setting in this whole repo with the most other things quietly tied to
+it. Changing it means also touching:
+
+| Setting | Where | Why |
+|---|---|---|
+| `--percentile` | `analyze.py` | `len = 100/(100-percentile)` — must still solve for `patch_len` |
+| `--target_len` | `precompute_boundaries.py` | Stage 1's own target; independent flag, same formula |
+| `--boundary_target_len` | `hierarchical.py --endogenous` | Stage 2's own target — **easy to miss**, it's a separate flag from the one above, not shared |
+| `--byte_ctx_len` | `hierarchical.py` (all regimes) | sized to cover roughly one previous patch + slack; if it's smaller than the new `patch_len`, cross-patch context starts truncating even a single patch |
+| `--Lcap` | `hierarchical.py` (dynamic/endogenous) | hard ceiling on any one patch's length, independent of the entropy threshold — must stay comfortably above `target_len`/`boundary_target_len`, or a growing fraction of patches hit the cap instead of the entropy rule |
+| `--steps` / `--boundary_freeze_step` | `hierarchical.py` | `bytes_per_step = batch_size × patch_len × patches` changes, so the same step count means a different amount of data seen — see "How many steps do I need?" above |
+
+**Worked example — doubling `patch_len` from 6 to 12** (`--patches 32`,
+`--batch_size 16` unchanged):
+
+- `percentile = 100 − 100/12 ≈ 91.7` (was ~83.3 for `patch_len=6`)
+- `--target_len 12` (Stage 1) and `--boundary_target_len 12` (Stage 2) —
+  both, not just one
+- `--byte_ctx_len 16` — the original `8` covered `patch_len=6` with 2 bytes
+  of slack (~33% overhead); `16` keeps roughly that same proportion for
+  `patch_len=12`
+- `--Lcap 64` — comfortably above `target_len=12` (the original `32` sat
+  ~5.3× above `patch_len=6`; `64` keeps a similar margin over `12`)
+- `bytes_per_step = 16 × 12 × 32 = 6144` (was `3072`) — to keep the *same*
+  98.3M bytes of total exposure as the repo's own 32,000-step runs, halve
+  `--steps` to `16000`; to keep the *same step count instead*, `--steps
+  32000` now means ~4.97 equivalent epochs, not ~2.5
+- `--boundary_freeze_step`: the ~1000-step (4,096,000-byte) sweet spot from
+  the entropy-model sweep translates to `4,096,000 ÷ 6144 ≈ 667` at this
+  new `bytes_per_step` — not the `1300` this README quotes elsewhere, which
+  was computed for `patch_len=6`
+
+None of this is enforced by the code — nothing will error if you change
+`--patch_len` alone and leave the rest at their defaults, it'll just quietly
+train on a mismatched, worse-calibrated setup.
 
 **Boundary head capacity (Stage 2 only)** — `--boundary_d_model`,
 `--boundary_depth`, `--boundary_head_dim`, `--boundary_window` are all CLI

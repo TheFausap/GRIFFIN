@@ -379,6 +379,13 @@ def main():
     p.add_argument("--top_p", type=float, default=0.0,
                    help="0 = disabled; else nucleus-sample the smallest top set with "
                         "cumulative probability >= top_p")
+    p.add_argument("--Lcap", type=int, default=32,
+                   help="max length any single dynamic/endogenous patch is allowed to reach "
+                        "before being force-cut, regardless of the entropy threshold (bounds "
+                        "memory in build_ragged). Must stay comfortably above --target_len / "
+                        "--boundary_target_len -- if patch_len approaches this value, raise it, "
+                        "or a growing fraction of patches will hit the cap instead of the "
+                        "entropy rule and the patch-length distribution will be distorted.")
     args = p.parse_args()
 
     if args.endogenous:
@@ -477,7 +484,7 @@ def main():
         print(f"initial threshold: {threshold:.3f} bits (target len {args.boundary_target_len})\n")
 
     def endo_mask(x):
-        return batched_entropy_mask(boundary_head, x, threshold, Lcap=32)
+        return batched_entropy_mask(boundary_head, x, threshold, Lcap=args.Lcap)
 
     @torch.no_grad()
     def eval_loss():
@@ -487,7 +494,7 @@ def main():
         for _ in range(args.eval_batches):
             if DYN:
                 x, m = get_batch(val, val_m)
-                p_, pl_, pm_, bm_ = build_ragged(x, m)
+                p_, pl_, pm_, bm_ = build_ragged(x, m, Lcap=args.Lcap)
                 l, aux = forward_ragged(model, x, p_, pl_, pm_, bm_)
                 first += aux["loss_first"].item(); within += aux["loss_within"].item()
                 mlen += aux["mean_patch_len"].item()
@@ -495,12 +502,12 @@ def main():
                     # exactly the mask build_ragged used internally (forced start + Lcap
                     # splits) -- the real boundaries hier's own first/within were scored on.
                     adj_m = m.clone(); adj_m[:, 0] = True
-                    adj_m = cap_patch_lengths(adj_m, Lcap=32)
+                    adj_m = cap_patch_lengths(adj_m, Lcap=args.Lcap)
                     r = flat_first_within(flat, x, adj_m)
             elif ENDO and not frozen:
                 x = get_batch(val)
                 m = endo_mask(x)
-                p_, pl_, pm_, bm_ = build_ragged(x, m)
+                p_, pl_, pm_, bm_ = build_ragged(x, m, Lcap=args.Lcap)
                 l, aux = forward_ragged(model, x, p_, pl_, pm_, bm_)
                 first += aux["loss_first"].item(); within += aux["loss_within"].item()
                 mlen += aux["mean_patch_len"].item()
@@ -605,7 +612,7 @@ def main():
 
         if DYN:
             x, m = get_batch(train, train_m)
-            p_, pl_, pm_, bm_ = build_ragged(x, m)
+            p_, pl_, pm_, bm_ = build_ragged(x, m, Lcap=args.Lcap)
             loss, _ = forward_ragged(model, x, p_, pl_, pm_, bm_)
         elif ENDO:      # not frozen yet -- boundary head still training, live per-step mask
             x = get_batch(train)
@@ -630,7 +637,7 @@ def main():
                 if x.shape[1] > 1:
                     m[:, 1:] = ent[:, :-1] > threshold
 
-            p_, pl_, pm_, bm_ = build_ragged(x, m)
+            p_, pl_, pm_, bm_ = build_ragged(x, m, Lcap=args.Lcap)
             loss, _ = forward_ragged(model, x, p_, pl_, pm_, bm_)
         else:
             _, loss = model(get_batch(train))
@@ -704,8 +711,8 @@ def main():
         print(f"\n--- sample (autonomous, dynamic patches, threshold {thr:.2f} bits, {src}, "
               f"temperature {args.temperature} top_k {args.top_k} top_p {args.top_p}) ---")
         print(repr(model.generate_dynamic(240, device, entropy_model, thr, prompt=b"The ",
-                                          temperature=args.temperature, top_k=args.top_k,
-                                          top_p=args.top_p)))
+                                          Lcap=args.Lcap, temperature=args.temperature,
+                                          top_k=args.top_k, top_p=args.top_p)))
         return
 
     # ------- sample (skip if the run diverged) -------
