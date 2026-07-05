@@ -255,6 +255,33 @@ well past 256 without also raising `d_rnn`, you're skewing that ratio. To
 change it, edit `HierConfig`'s `d_rnn` default directly in
 `hierarchical.py`.
 
+**A bigger model needs proportionally more steps, not just a bigger
+`--d_model`.** Both `hierarchical.py` and `train_verdict.py` print the
+model's exact parameter count at startup (`params=X.XXM`) — use it. The
+source paper scales its own training tokens with parameter count following
+Chinchilla (Hoffmann et al., 2022): its Appendix C table trains a 100M model
+on 1.9B tokens, 200M on 3.9B, 400M on 7.8B — a consistent **~19–20 tokens
+per parameter**. Using the bytes-of-exposure formula above, that translates
+to a target step count:
+
+```
+steps ≈ (20 × params) ÷ (batch_size × patch_len × patches)
+```
+
+One honest caveat: Chinchilla's ratio was measured on subword tokens, and a
+raw byte carries a lot less information than a BPE token (roughly 4–5 bytes
+per token for English text) — so 20 *bytes* per parameter is probably an
+optimistic floor for a byte-level model, not a safe target. Worth knowing
+where this repo's own runs actually sit: ~6.9M params at 32,000 steps
+(`batch_size=16`, `patch_len=6`, `patches=32`) is **~14 bytes/param** —
+already under the raw Chinchilla ratio, let alone a byte-adjusted one. That
+lines up with the "scale and training budget" caveat in
+`paper/main.pdf`'s open questions, not a new problem: if you scale the
+model up, scale `--steps` (or corpus size) at least proportionally, and
+treat the formula above as a starting point to check against — not a
+substitute for watching whether `val` in the training log is still
+dropping or has plateaued.
+
 **More context** — raise `--patches` and/or `--patch_len` (the training
 window is `patches × patch_len` bytes). This used to hit an O(sequence²)
 memory wall in `LocalMQA`'s attention; that's fixed now (blockwise,
