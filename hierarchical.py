@@ -165,8 +165,10 @@ class HierByteLM(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, n_patches, device, prompt=b"", temperature=1.0):
-        """Autonomous generation: emit n_patches new patches of L bytes each."""
+    def generate(self, n_patches, device, prompt=b"", temperature=0.0, top_k=0, top_p=0.0):
+        """Autonomous generation: emit n_patches new patches of L bytes each.
+        Greedy (argmax) by default; pass temperature>0 (optionally with
+        top_k/top_p) to sample instead -- see patcher.sample_from_logits."""
         L = self.cfg.patch_len
         K = self.cfg.byte_ctx_len
         pad_id = self.decoder.BOS
@@ -187,7 +189,8 @@ class HierByteLM(nn.Module):
             # many previous patches as needed, not just the last one
             ctx = [pad_id] * max(0, K - len(out)) + out[-K:]
             prev_ctx = torch.tensor([ctx], dtype=torch.long, device=device)
-            gen = self.decoder.generate(cond, torch.tensor([L], device=device), prev_ctx)  # [1,L]
+            gen = self.decoder.generate(cond, torch.tensor([L], device=device), prev_ctx,
+                                         temperature=temperature, top_k=top_k, top_p=top_p)  # [1,L]
             out.extend(int(b) for b in gen[0].tolist())
         return bytes(b & 0xFF for b in out)
 
@@ -207,7 +210,8 @@ class HierByteLM(nn.Module):
         return e.view(1, P, self.cfg.d_model)
 
     @torch.no_grad()
-    def generate_dynamic(self, n_bytes, device, entropy_model, threshold, prompt=b"", Lcap=32):
+    def generate_dynamic(self, n_bytes, device, entropy_model, threshold, prompt=b"", Lcap=32,
+                          temperature=0.0, top_k=0, top_p=0.0):
         """
         Autonomous generation for the DYNAMIC (entropy-boundary) model. Patch
         length isn't fixed like `generate`'s n_patches*L -- after every
@@ -216,7 +220,9 @@ class HierByteLM(nn.Module):
         the byte just emitted closes the current patch. This reproduces the
         offline training-time boundary rule exactly (see dynamic.py's
         next_byte_entropy/segment_causal), so an already-trained dynamic
-        checkpoint generates autonomously with no retraining.
+        checkpoint generates autonomously with no retraining. Greedy (argmax)
+        by default; pass temperature>0 (optionally with top_k/top_p) to sample
+        instead -- see patcher.sample_from_logits.
         """
         self.eval()
         K = self.cfg.byte_ctx_len
@@ -243,7 +249,7 @@ class HierByteLM(nn.Module):
         cur, h, z = self.decoder.start_state(cond, prev_ctx)
 
         while len(out) < n_bytes:
-            nxt, h = self.decoder.step(cur, h, z)
+            nxt, h = self.decoder.step(cur, h, z, temperature=temperature, top_k=top_k, top_p=top_p)
             b = int(nxt.item())
             out.append(b); cur_patch.append(b)
             cur = nxt
@@ -366,6 +372,13 @@ def main():
                         "boundaries.npz was actually built with)")
     p.add_argument("--boundary_scan_ctx", type=int, default=256)
     p.add_argument("--boundary_scan_batch", type=int, default=8)
+    p.add_argument("--temperature", type=float, default=0.0,
+                   help="end-of-run sample: 0 = greedy (argmax, the old default); >0 samples "
+                        "from the softmax at this temperature -- see patcher.sample_from_logits")
+    p.add_argument("--top_k", type=int, default=0, help="0 = disabled; else keep top-k logits")
+    p.add_argument("--top_p", type=float, default=0.0,
+                   help="0 = disabled; else nucleus-sample the smallest top set with "
+                        "cumulative probability >= top_p")
     args = p.parse_args()
 
     if args.endogenous:
@@ -688,8 +701,11 @@ def main():
             print("\n(dynamic mode: pass --entropy_ckpt to also enable autonomous generation "
                   "-- it reuses that frozen model + boundaries.npz's threshold online.)")
             return
-        print(f"\n--- sample (autonomous, dynamic patches, threshold {thr:.2f} bits, {src}) ---")
-        print(repr(model.generate_dynamic(240, device, entropy_model, thr, prompt=b"The ")))
+        print(f"\n--- sample (autonomous, dynamic patches, threshold {thr:.2f} bits, {src}, "
+              f"temperature {args.temperature} top_k {args.top_k} top_p {args.top_p}) ---")
+        print(repr(model.generate_dynamic(240, device, entropy_model, thr, prompt=b"The ",
+                                          temperature=args.temperature, top_k=args.top_k,
+                                          top_p=args.top_p)))
         return
 
     # ------- sample (skip if the run diverged) -------
@@ -697,8 +713,10 @@ def main():
         print("\n(skipping sample: non-finite weights. Resume from best.pt / last.pt "
               "at a lower --lr.)")
         return
-    print("\n--- sample (autonomous, fixed-length patches) ---")
-    print(repr(model.generate(40, device, prompt=b"The ")))
+    print(f"\n--- sample (autonomous, fixed-length patches, temperature {args.temperature} "
+          f"top_k {args.top_k} top_p {args.top_p}) ---")
+    print(repr(model.generate(40, device, prompt=b"The ",
+                              temperature=args.temperature, top_k=args.top_k, top_p=args.top_p)))
 
 
 if __name__ == "__main__":

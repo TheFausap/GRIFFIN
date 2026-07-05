@@ -244,6 +244,20 @@ class RecurrentBlock(nn.Module):
 # Local sliding-window Multi-Query Attention + RoPE  (Section 2.3)
 # --------------------------------------------------------------------------- #
 class LocalMQA(nn.Module):
+    """
+    Sliding-window causal MQA, evaluated blockwise so cost is O(T*W) instead
+    of O(T^2): chop the sequence into non-overlapping blocks of size W (the
+    configured window), and let each query block attend only to itself plus
+    the immediately preceding block. A query at local position i in block n
+    can see at most W-1 positions back, and the preceding block holds exactly
+    W positions immediately before the current block's start -- so
+    "previous ++ current" (2W keys) is always a sufficient key context;
+    nothing outside it would have survived the causal+window mask anyway.
+    Mathematically identical to computing the full T x T scores and masking
+    down to the local window (verified in this file's __main__ self-test),
+    just without ever materializing the O(T^2) matrix.
+    """
+
     def __init__(self, cfg: GriffinConfig):
         super().__init__()
         self.h = cfg.num_heads
@@ -255,6 +269,17 @@ class LocalMQA(nn.Module):
         self.v = nn.Linear(cfg.d_model, self.dh, bias=False)
         self.o = nn.Linear(self.h * self.dh, cfg.d_model, bias=False)
         self.attn_drop = nn.Dropout(cfg.dropout)
+
+        # Causal+window mask over a (prev-block ++ current-block) key context,
+        # shared by every block except the first (no real previous block --
+        # zeroed per-call in forward). Depends only on `window`, not on batch
+        # or sequence length, so it's computed once here.
+        W = self.window
+        i = torch.arange(W).unsqueeze(1)             # [W,1]  query, local pos in current block
+        c = torch.arange(2 * W).unsqueeze(0)         # [1,2W] key, position in prev++curr context
+        prev_valid = (c < W) & (i < c)               # earlier block: only its last W-1 positions
+        curr_valid = (c >= W) & ((c - W) <= i)        # current block: ordinary causal
+        self.register_buffer("_mask", prev_valid | curr_valid, persistent=False)   # [W,2W] bool
 
     def _rope(self, x, T, device):                 # x: [..., T, dh]
         half = self.dh // 2
@@ -268,22 +293,43 @@ class LocalMQA(nn.Module):
 
     def forward(self, x):
         B, T, _ = x.shape
-        q = self.q(x).view(B, T, self.h, self.dh).transpose(1, 2)   # [B,H,T,dh]
-        k = self.k(x).unsqueeze(1)                                  # [B,1,T,dh]
-        v = self.v(x).unsqueeze(1)                                  # [B,1,T,dh]
-        q = self._rope(q, T, x.device)
-        k = self._rope(k, T, x.device)
+        W = self.window
+        device = x.device
 
-        scores = (q @ k.transpose(-1, -2)) / math.sqrt(self.dh)     # [B,H,T,T]
-        idx = torch.arange(T, device=x.device)
-        causal = idx[None, :] <= idx[:, None]                       # j <= i
-        in_window = (idx[:, None] - idx[None, :]) < self.window     # i - j < W
-        mask = causal & in_window
-        scores = scores.masked_fill(~mask, float("-inf"))
+        q = self.q(x).view(B, T, self.h, self.dh).transpose(1, 2)   # [B,H,T,dh]
+        k = self.k(x).unsqueeze(1)                                   # [B,1,T,dh]
+        v = self.v(x).unsqueeze(1)                                   # [B,1,T,dh]
+        q = self._rope(q, T, device)                                 # rope uses TRUE positions,
+        k = self._rope(k, T, device)                                 # applied before any padding
+
+        pad = (-T) % W
+        if pad:
+            q = F.pad(q, (0, 0, 0, pad))
+            k = F.pad(k, (0, 0, 0, pad))
+            v = F.pad(v, (0, 0, 0, pad))
+        Tp = T + pad
+        nb = Tp // W
+
+        qb = q.view(B, self.h, nb, W, self.dh)
+        kb = k.view(B, 1, nb, W, self.dh)
+        vb = v.view(B, 1, nb, W, self.dh)
+
+        k_prev = torch.cat([torch.zeros_like(kb[:, :, :1]), kb[:, :, :-1]], dim=2)  # [B,1,nb,W,dh]
+        v_prev = torch.cat([torch.zeros_like(vb[:, :, :1]), vb[:, :, :-1]], dim=2)
+        k_ctx = torch.cat([k_prev, kb], dim=3)                        # [B,1,nb,2W,dh]
+        v_ctx = torch.cat([v_prev, vb], dim=3)
+
+        scores = torch.matmul(qb, k_ctx.transpose(-1, -2)) / math.sqrt(self.dh)  # [B,H,nb,W,2W]
+
+        mask = self._mask.unsqueeze(0).expand(nb, W, 2 * W).clone()
+        mask[0, :, :W] = False                      # block 0 has no real previous block
+        scores = scores.masked_fill(~mask.view(1, 1, nb, W, 2 * W), float("-inf"))
 
         attn = scores.softmax(-1)
         attn = self.attn_drop(attn)
-        out = (attn @ v).transpose(1, 2).reshape(B, T, self.h * self.dh)
+        out = torch.matmul(attn, v_ctx)                               # [B,H,nb,W,dh]
+        out = out.reshape(B, self.h, Tp, self.dh)[:, :, :T]           # drop padding -> [B,H,T,dh]
+        out = out.transpose(1, 2).reshape(B, T, self.h * self.dh)
         return self.o(out)
 
 
@@ -353,11 +399,49 @@ class Griffin(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
 
+def _brute_force_local_mqa(mqa, x):
+    """Reference O(T^2) computation (the old LocalMQA implementation) --
+    full scores, then masked down to the causal+window band. Test-only: the
+    real forward() never materializes this."""
+    B, T, _ = x.shape
+    q = mqa.q(x).view(B, T, mqa.h, mqa.dh).transpose(1, 2)
+    k = mqa.k(x).unsqueeze(1)
+    v = mqa.v(x).unsqueeze(1)
+    q = mqa._rope(q, T, x.device)
+    k = mqa._rope(k, T, x.device)
+    scores = (q @ k.transpose(-1, -2)) / math.sqrt(mqa.dh)
+    idx = torch.arange(T, device=x.device)
+    causal = idx[None, :] <= idx[:, None]
+    in_window = (idx[:, None] - idx[None, :]) < mqa.window
+    mask = causal & in_window
+    scores = scores.masked_fill(~mask, float("-inf"))
+    attn = scores.softmax(-1)
+    out = (attn @ v).transpose(1, 2).reshape(B, T, mqa.h * mqa.dh)
+    return mqa.o(out)
+
+
 # --------------------------------------------------------------------------- #
 # Sanity check
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
     torch.manual_seed(0)
+
+    # LocalMQA's O(T*W) blockwise attention must be numerically identical to
+    # the O(T^2) full-scores-then-mask reference it replaced -- same causal +
+    # window pattern, just never materializing the T x T matrix. Check across
+    # T shorter than / equal to / not a multiple of / much larger than window.
+    for T, W in [(15, 32), (32, 32), (40, 32), (100, 32), (65, 16)]:
+        mqa = LocalMQA(GriffinConfig(vocab_size=256, d_model=128, d_rnn=192, depth=1,
+                                     head_dim=32, window_size=W, dropout=0.0)).eval()
+        xin = torch.randn(2, T, 128)
+        with torch.no_grad():
+            out_block = mqa(xin)
+            out_brute = _brute_force_local_mqa(mqa, xin)
+        max_diff = (out_block - out_brute).abs().max().item()
+        assert torch.allclose(out_block, out_brute, atol=1e-5), \
+            f"LocalMQA mismatch at T={T}, W={W}: max diff {max_diff}"
+        print(f"LocalMQA blockwise == brute-force at T={T:3d} W={W:3d}: OK (max diff {max_diff:.2e})")
+
     # Small config so it runs on CPU in a second.
     cfg = GriffinConfig(
         vocab_size=256, d_model=256, d_rnn=384, depth=6,

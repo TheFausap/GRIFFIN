@@ -226,13 +226,80 @@ extract more from them regardless of K. Going wider (K=24, 32) is unlikely to
 move this further; the bottleneck looks like *how* the context is summarized,
 not *how much* of it is provided.
 
-## 9. Next step
+## 9. Round 5 — Stage 2, Option B: endogenous boundary head
 
-Stopping the `byte_ctx_len`-widening thread here (diminishing returns, per
-round 4). The next real architecture change is the one scoped as "Option B" in
-the Stage-2 discussion: an endogenous next-byte head on the encoder's own
-causal state, replacing the external frozen entropy model as the boundary
-source entirely. Bigger than every change so far — new causal encoder
-structure, a new auxiliary training loss, full retraining, and new boundary-
-quality gates around the resulting signal — scoped as its own phase rather
-than folded into this round's single-variable discipline.
+Stopped the `byte_ctx_len`-widening thread at round 4 (diminishing returns)
+and moved to the real architecture change scoped as "Option B": replace the
+external frozen entropy model as the boundary source with a small
+`BoundaryHead` (`boundary_head.py`, a plain `Griffin` instance) trained
+*jointly*, with its own optimizer, on the same byte windows the hierarchical
+model already samples. Pre-freeze, boundaries come from the still-training
+head with a periodically-recalibrated threshold; at a freeze step it stops
+updating, one real whole-corpus scan runs (reusing
+`precompute_boundaries.py`'s own `compute_surprise`/`solve_threshold`), and
+the run collapses into the *exact*, unmodified Stage-1 static-mask path for
+the remainder of training.
+
+Empirically calibrated the freeze point first (not guessed): a standalone
+`train_verdict.py` sweep at step budgets 200/1000/2000/4000/8000, gated by an
+objective mid-word-fragmentation metric, showed boundary quality *degrading*
+monotonically past ~1000 steps (10.6%→10.0%→11.4%→13.4%→15.6%) — the same
+"overtraining smooths away the signal" effect the original entropy model's
+design guarded against. Translated to this trainer's own batch/step schedule:
+`--boundary_freeze_step 1300`.
+
+### Result — confirmed on two independent seeds
+
+All at `--eval_batches 100`, tail-averaged over the last ~10 eval points of a
+32k-step run (same corpus/split/decoder-context architecture as round 3's
+K=8 numbers):
+
+| | BPC | hier first (tax) | hier within (tax) | len |
+|---|---|---|---|---|
+| Fixed | 1.949 | 1.854 (+0.408) | 1.956 (+0.472) | 6 |
+| Stage-1 Dynamic (external entropy model) | 1.938 | 3.991 (+0.152) | 1.495 (+0.513) | 5.79 |
+| **Stage-2 Endogenous, seed 0** | **1.881** | 3.653 (+0.260) | 1.503 (+0.433) | 5.85 |
+| **Stage-2 Endogenous, seed 42** | **1.888** | 3.687 (+0.287) | 1.507 (+0.432) | 5.88 |
+
+**This is the first clear, noise-exceeding total-BPC win for any dynamic
+variant in the whole study** — ~0.05-0.06 bits/byte better than Stage-1
+dynamic, confirmed near-identically across two independently-trained seeds
+(BPC within 0.007, `hier_within` within 0.004, `tax_within` within 0.001 of
+each other).
+
+**The mechanism is not what a first guess would suggest.** `hier_within` is
+statistically unchanged from Stage-1 (~1.50 in both) — the win comes almost
+entirely from `hier_first` dropping substantially (~3.65-3.69 vs ~3.99). The
+external flat model agrees: `flat_first` also drops sharply under these
+boundaries (~3.39-3.40 vs ~3.84), meaning even the bigger, longer-trained
+reference model finds the endogenous head's chosen cut points less
+surprising than Stage-1's. `flat_within` moves the other way (~1.07 vs
+~0.98) — some difficulty shifted from patch-starts into patch-bodies — but
+`hier_within` absorbed that shift at no measurable cost. Read honestly: the
+small, briefly-trained endogenous head's surprise ranking doesn't fully agree
+with the bigger external model's; it systematically selects a different (and,
+on this corpus, more favorable) set of cut points, while still respecting
+word/sentence structure qualitatively (verified directly against the real
+frozen mask — boundaries land on onsets, e.g. "│more │sensual │minds of...",
+with the same modest fragmentation-on-unusual-words character as Stage-1's
+own boundaries, not a degenerate mask).
+
+Whether this reshuffling-of-difficulty effect is a robust property of
+jointly-trained/endogenous boundary ranking in general, or a specific quirk
+of this small head's capacity/freeze-point on this corpus, isn't something
+two same-config seeds can fully settle — it's confirmed *reproducible*, not
+yet confirmed *general*.
+
+## 10. Next step
+
+The headline result now stands on two-seed confirmation. Open threads, not
+mutually exclusive:
+- **Bank this as the study's main finding** — endogenous patching beats both
+  fixed and externally-guided dynamic patching on total BPC, the first clean
+  win either dynamic approach has produced.
+- **Understand *why* the endogenous ranking differs from the external one** —
+  capacity? freeze timing? training-objective differences? A mechanistic
+  question the current data can motivate but not answer.
+- Revisit the `byte_ctx_len`/cross-patch-context lever now that the boundary
+  policy itself has changed — round 4's "diminishing returns" verdict was
+  measured against Stage-1 boundaries, not these.

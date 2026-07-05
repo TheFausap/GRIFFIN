@@ -32,6 +32,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 # --------------------------------------------------------------------------- #
@@ -168,6 +169,40 @@ def prev_byte_window(x, patch_starts, K, pad_id):
     return torch.gather(xp.unsqueeze(1).expand(B, P, S + K), 2, idx)
 
 
+def sample_from_logits(logits, temperature=1.0, top_k=0, top_p=0.0):
+    """
+    logits      : [N, V] raw logits for the next token (already sliced to the
+                  relevant step -- no time dimension).
+    temperature : <= 0 means greedy (argmax), matching sample.py's convention
+                  of "no randomness" as the explicit opt-out.
+    top_k       : > 0 keeps only the top-k logits per row before sampling.
+    top_p       : in (0, 1] keeps the smallest top set of logits whose
+                  cumulative probability >= top_p (nucleus sampling), always
+                  keeping at least the top-1 token.
+    Returns [N, 1] sampled ids. top_k and top_p compose (top_k first) if both
+    are set.
+    """
+    if temperature <= 0:
+        return logits.argmax(-1, keepdim=True)
+    logits = logits / temperature
+
+    if top_k > 0:
+        k = min(top_k, logits.size(-1))
+        thresh = torch.topk(logits, k, dim=-1).values[..., -1, None]
+        logits = logits.masked_fill(logits < thresh, float("-inf"))
+
+    if top_p > 0.0:
+        sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+        probs = F.softmax(sorted_logits, dim=-1)
+        cum_probs = torch.cumsum(probs, dim=-1)
+        drop = (cum_probs - probs) > top_p       # cumulative mass *before* this token
+        sorted_logits = sorted_logits.masked_fill(drop, float("-inf"))
+        logits = torch.full_like(logits, float("-inf")).scatter(-1, sorted_idx, sorted_logits)
+
+    probs = F.softmax(logits, dim=-1)
+    return torch.multinomial(probs, num_samples=1)
+
+
 # --------------------------------------------------------------------------- #
 # Patch decoder
 # --------------------------------------------------------------------------- #
@@ -232,8 +267,10 @@ class PatchDecoder(nn.Module):
         return self.out(out)                              # [P, Lmax, vocab]
 
     @torch.no_grad()
-    def generate(self, z, lengths, prev_ctx=None):
-        """Greedy free-running reconstruction. z: [P,d_model]; lengths: [P]."""
+    def generate(self, z, lengths, prev_ctx=None, temperature=0.0, top_k=0, top_p=0.0):
+        """Free-running reconstruction. z: [P,d_model]; lengths: [P]. Greedy
+        (argmax) by default -- pass temperature>0 (and optionally top_k/top_p)
+        to sample instead; see sample_from_logits."""
         z = self._augment(z, prev_ctx)
         P = z.shape[0]
         Lmax = int(torch.as_tensor(lengths).max())
@@ -245,7 +282,7 @@ class PatchDecoder(nn.Module):
             e = self.in_embed(cur)                        # [P,1,d_byte]
             step = torch.cat([e, z.unsqueeze(1)], dim=-1)
             y, h = self.gru(step, h)
-            nxt = self.out(y[:, -1]).argmax(-1, keepdim=True)   # [P,1]
+            nxt = sample_from_logits(self.out(y[:, -1]), temperature, top_k, top_p)  # [P,1]
             outs.append(nxt)
             cur = nxt
         return torch.cat(outs, dim=1)                     # [P, Lmax]
@@ -253,8 +290,8 @@ class PatchDecoder(nn.Module):
     @torch.no_grad()
     def start_state(self, z, prev_ctx=None):
         """
-        Begin a step-by-step greedy decode of ONE new patch (unknown length --
-        for callers that decide, byte by byte, when the patch is done, e.g. a
+        Begin a step-by-step decode of ONE new patch (unknown length -- for
+        callers that decide, byte by byte, when the patch is done, e.g. a
         dynamic-patching generation loop). z: [P,d_model] (P=1 for a single
         online stream). Returns (cur, h, z_aug) to feed into `step`.
         """
@@ -264,14 +301,15 @@ class PatchDecoder(nn.Module):
         return cur, self._h0(z), z
 
     @torch.no_grad()
-    def step(self, cur, h, z):
-        """One greedy GRU step. cur: [P,1] last byte id (BOS for the first step
-        of a patch). Returns (next_id [P,1], new_h) -- call repeatedly, feeding
-        each returned id back in as `cur`, until the caller's own stopping rule
-        fires (there's no length baked in here, unlike `generate`)."""
+    def step(self, cur, h, z, temperature=0.0, top_k=0, top_p=0.0):
+        """One GRU step. cur: [P,1] last byte id (BOS for the first step of a
+        patch). Returns (next_id [P,1], new_h) -- call repeatedly, feeding each
+        returned id back in as `cur`, until the caller's own stopping rule
+        fires (there's no length baked in here, unlike `generate`). Greedy
+        (argmax) by default -- see sample_from_logits."""
         e = self.in_embed(cur)                            # [P,1,d_byte]
         y, h = self.gru(torch.cat([e, z.unsqueeze(1)], dim=-1), h)
-        nxt = self.out(y[:, -1]).argmax(-1, keepdim=True)  # [P,1]
+        nxt = sample_from_logits(self.out(y[:, -1]), temperature, top_k, top_p)  # [P,1]
         return nxt, h
 
 
