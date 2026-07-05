@@ -131,7 +131,10 @@ positions should be word-initial bytes. If they don't, check these in order
    fragmentation rising monotonically from 10.6% at 200 steps to 15.6% at
    8000 steps on the same corpus/preset — quality peaked early, then
    degraded steadily with more training. If your run used more than a
-   couple thousand steps, that's the first thing to cut back.
+   couple thousand steps, that's the first thing to cut back. That sweep
+   used `train_verdict.py`'s own defaults (`--batch_size 32 --block_size
+   128`); if you changed either, translate by *bytes seen*, not raw steps —
+   see "How many steps do I need?" below.
 3. **Boundaries look noisy / don't track words at all → likely
    undertrained or too small.** Raise `--max_iters` a bit, or move up a
    size preset (`--size tiny` → `small` → `medium`) — capacity has to be
@@ -141,6 +144,47 @@ positions should be word-initial bytes. If they don't, check these in order
 
 Re-run step 2 after any change — it's cheap and it's the actual gate, not a
 one-time formality.
+
+#### How many steps do I need?
+
+`--steps`/`--max_iters` alone doesn't tell you how much data the model has
+seen — that also depends on batch size and sequence length. The quantity
+that's actually comparable across different settings is **bytes of
+gradient exposure**:
+
+```
+bytes_per_step = batch_size × sequence_length
+total_bytes    = steps × bytes_per_step
+```
+
+where `sequence_length` is `block_size` for `train_verdict.py`, or
+`patch_len × patches` for `hierarchical.py`. Training samples random
+windows *with replacement*, not epoch by epoch, so `total_bytes ÷
+corpus_size` is an **equivalent epoch count**, not an exact count of unique
+bytes seen — but it's the right number to compare across runs with
+different batch sizes or sequence lengths.
+
+Worked example — this repo's own `hierarchical.py` defaults
+(`batch_size=16`, `patch_len=6`, `patches=32` → 3072 bytes/step) at
+`--steps 32000`:
+
+```
+32000 × 3072 = 98,304,000 bytes of exposure
+```
+
+Against the ~39.6M-byte corpus used throughout this project's own
+experiments, that's **~2.5 equivalent epochs** — the actual scale every
+result in `RESULTS_ANNEX.md` was measured at. If your corpus is a
+different size, scale `--steps` so `total_bytes` lands wherever you want
+relative to your own corpus size, e.g. for ~3 epochs:
+`steps = 3 × corpus_size_bytes ÷ (batch_size × patch_len × patches)`.
+
+The same formula is what translates the entropy-model sweep above between
+different `--batch_size`/`--block_size` choices: that sweep's "~1000 steps"
+sweet spot is really **4,096,000 bytes of exposure** (`1000 × 32 × 128`);
+if you use different batch/block sizes, divide 4,096,000 by
+`your_batch_size × your_block_size` to get the equivalent step count for
+your settings, rather than reusing "1000" literally.
 
 ### 3. Train the fixed-stride baseline
 
