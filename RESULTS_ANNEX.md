@@ -111,9 +111,128 @@ bottleneck matters comparatively less there.
   the wrong directory was passed, preventing a silent misalignment. All
   numbers in this annex are the corrected re-run against `corpus/` only.
 
-## 6. Next step
+## 6. Round 2 — cross-patch byte context in `PatchDecoder`
 
-Give `PatchDecoder` real cross-patch raw-byte context (the previous patch's
-trailing bytes), holding the entropy model, corpus, split, and LR schedule
-fixed — one architecture variable changed, retrained on both fixed and
-dynamic patching for a repeat of the head-to-head table above.
+Implemented exactly the single change §3.3/§6 called for: `PatchDecoder` now
+receives `prev_ctx`, the trailing `byte_ctx_len=8` raw bytes of the *previous*
+patch (via `patcher.prev_patch_tail`, shared by the fixed and ragged paths),
+embedded with the decoder's own byte table and projected into the
+conditioning vector alongside `z = c_{k-1}`. Patch 0 gets an all-pad window
+(same "nothing before this" convention as the learned `start` vector).
+Nothing else changed: same corpus, split, entropy checkpoint, LR schedule,
+32,000 steps, both regimes retrained from scratch.
+
+### Head-to-head, best checkpoint each
+
+| | BPC | hier first (tax) | hier within (tax) |
+|---|---|---|---|
+| Fixed, before → after | 1.960 → **1.891** | 1.804 (+0.416) → 1.812 (+0.388) | 1.980 (+0.530) → **1.896 (+0.479)** |
+| Dynamic, before → after | 1.987 → **1.903** | 3.982 (+0.148) → 4.007 (+0.165) | 1.560 (+0.603) → **1.467 (+0.518)** |
+
+### Tail-averaged (steps 30400/30800–32000, the more honest number given 20 eval batches/point)
+
+| | BPC | hier within |
+|---|---|---|
+| Fixed, before → after | 1.995 → 1.942 | 2.011 → 1.947 |
+| Dynamic, before → after | 2.023 → 1.943 | ~1.55 → ~1.50 |
+
+### Findings
+
+**6.1 — Confirmed architecture-wide, a second time.** `hier_within` dropped
+~0.06–0.09 bits/byte in *both* regimes; `hier_first`/`tax_first` stayed flat
+in both (fixed 1.858→1.859, dynamic 4.010→3.997, tail-averaged) — exactly the
+predicted shape, since the fix targets within-patch prediction only.
+
+**6.2 — The fixed-vs-dynamic total-BPC gap collapsed from real to noise-level.**
+Tail-averaged: **0.028 bits/byte before → 0.0008 after.** Best-checkpoint:
+0.027 → 0.012. Neither is distinguishable from the ±0.03–0.05 per-step eval
+noise (20 batches/eval) any more — fixed and dynamic are now statistically
+tied on total BPC, down from a small but real dynamic deficit.
+
+**6.3 — Dynamic did not flip ahead in total BPC, but that was never the axis
+the fix targeted, and the axis it does target held up under a second decoder
+architecture.** Fixed-within minus dynamic-within was 0.420 bits/byte before
+the change, 0.429 after — the entropy-boundary within-advantage is robust
+across two different decoders now, not an artifact of the old decoder's
+specific weakness.
+
+**6.4 — Open question: is the residual ~0.001–0.012 gap real or pure noise?**
+`eval_loss()` samples only 20 batches/eval (a comment in the code already
+flags "bump to ~50 for the real comparison"). Given the gap is now this
+small, a confirmatory pass with more eval batches on both final checkpoints
+is the natural next no-train measurement before drawing a final verdict on
+whether dynamic patching wins on total BPC outright.
+
+## 7. Round 3 — confirmatory eval at `--eval_batches 100`
+
+`eval_loss()`'s batch count was hardcoded at 20; added `--eval_batches` (§6.4's
+open question) and re-evaluated both final checkpoints via `--resume` at
+`--eval_batches 100`. Caveat: `--resume` continues training from the
+checkpoint's saved step rather than freezing it, so this is a continuation,
+not a perfectly frozen repeat-eval — dynamic resumed at step 31201 (4 eval
+points to 32000), fixed at 31801 (1 eval point). Both are past the LR floor,
+so the extra steps have minimal effect; the conclusion below doesn't hinge on
+this asymmetry.
+
+| | BPC | hier within (tax) |
+|---|---|---|
+| Fixed (single point, step 31999) | 1.949 | 1.956 (+0.472) |
+| Dynamic (avg of 4, steps 31400–31999) | 1.938 (range 1.916–1.955) | 1.495 (+0.513) |
+
+**Verdict: the total-BPC gap is confirmed noise-level, not real** — 1.949 vs
+1.938 (or vs any of dynamic's individual 1.916–1.955 points) is a dead heat,
+resolving §6.4. **The within-loss advantage is confirmed unambiguous at this
+lower noise floor** — 1.956 vs 1.495, a **0.46 bit/byte gap**, if anything
+larger than the n=20 estimate (0.43) and now far outside any remaining noise.
+`hier_first`/`tax_first` stayed exactly where predicted (fixed 1.854/+0.408,
+dynamic avg 3.991/+0.152) — untouched by the decoder fix, as designed.
+
+## 8. Round 4 — widen the cross-patch context window (`byte_ctx_len` 8 → 16)
+
+Also redesigned `prev_patch_tail` → `prev_byte_window`: the old version only
+ever looked inside patch k-1, so for the common case (dynamic's mean patch
+length ~5.8-6 already fits inside K=8) widening K would have done nothing —
+extra window slots would just stay padding. The redesign slides the window
+over the raw byte stream by *offset*, so a short patch naturally lets it
+spill into patch k-2, k-3, etc. Unit-verified against hand-computed cases
+before retraining. Both regimes retrained from scratch at `--byte_ctx_len 16`,
+same corpus/split/entropy checkpoint/steps, `--eval_batches 100` from the
+start this time (avoiding round 3's two-pass confirmation dance).
+
+| | BPC | hier within (tax) | hier first (tax) |
+|---|---|---|---|
+| Fixed, K=8 → K=16 | 1.949 → 1.926 | 1.956 (+0.472) → 1.934 (+0.481) | 1.854 (+0.408) → 1.827 (+0.405) |
+| Dynamic, K=8 → K=16 | 1.955 → 1.929 | 1.511 (+0.517) → 1.491 (+0.521) | 3.999 (+0.153) → 3.999 (+0.155) |
+
+(single eval point per run at step 31999, not a tail-average like round 3's
+confirmatory pass — read accordingly.)
+
+**Verdict: diminishing-to-no returns.** Both regimes improved by a similar,
+modest ~0.02-0.03 bits/byte in total BPC — consistent enough across two
+independently-trained runs to likely be a small real effect, not pure noise.
+But `tax_within` itself didn't move (flat or marginally up in both regimes):
+the improvement in `hier_within` was matched by an equivalent shift in
+`flat_within`'s own random-batch estimate (the frozen entropy model is scored
+on fresh random val batches each run, so its number wobbles run-to-run even
+though the model is frozen) — no evidence the wider window closed more of the
+decoder's cross-patch leak specifically. Total BPC is still tied
+(dynamic 1.929 vs fixed 1.926) and dynamic's within-advantage is unchanged
+(1.934 − 1.491 = **0.443 bits/byte**, same as K=8's 0.44-0.46).
+
+Likely cause: `ctx_proj` is a single flat `Linear(K*d_byte, d_model)` — K
+independently-weighted byte-embedding slots summed together, no real sequence
+model over the window. More raw bytes doesn't help if the projection can't
+extract more from them regardless of K. Going wider (K=24, 32) is unlikely to
+move this further; the bottleneck looks like *how* the context is summarized,
+not *how much* of it is provided.
+
+## 9. Next step
+
+Stopping the `byte_ctx_len`-widening thread here (diminishing returns, per
+round 4). The next real architecture change is the one scoped as "Option B" in
+the Stage-2 discussion: an endogenous next-byte head on the encoder's own
+causal state, replacing the external frozen entropy model as the boundary
+source entirely. Bigger than every change so far — new causal encoder
+structure, a new auxiliary training loss, full retraining, and new boundary-
+quality gates around the resulting signal — scoped as its own phase rather
+than folded into this round's single-variable discipline.

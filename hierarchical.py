@@ -39,17 +39,20 @@ import math
 import os
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from griffin_cglru import (Griffin, GriffinConfig, ResidualBlock, RecurrentBlock,
                            LocalMQA, RMSNorm)
-from patcher import PatcherConfig, PatchEncoder, PatchDecoder, prev_patch_tail
+from patcher import PatcherConfig, PatchEncoder, PatchDecoder, prev_byte_window
 
 from dynamic import (load_boundary_mask, block_split_with_mask,
-                     build_ragged, forward_ragged, cap_patch_lengths)
+                     build_ragged, forward_ragged, cap_patch_lengths,
+                     load_threshold, next_byte_entropy, segment_causal)
 from eval_hook import load_flat_model, flat_first_within
+from boundary_head import batched_entropy_mask, recalibrate_threshold, build_boundaries
 
 # --------------------------------------------------------------------------- #
 # Config
@@ -151,9 +154,9 @@ class HierByteLM(nn.Module):
         # condition for patch k = context through patch k-1 (start vector for k=0)
         cond = torch.cat([self.start.expand(B, 1, -1), c[:, :-1]], dim=1)   # [B, P, d]
 
-        plens = torch.full((B, P), L, dtype=torch.long, device=tokens.device)
-        prev_ctx = prev_patch_tail(patches, plens, self.cfg.byte_ctx_len,
-                                    self.decoder.BOS).reshape(B * P, self.cfg.byte_ctx_len)
+        K = self.cfg.byte_ctx_len
+        patch_starts = (torch.arange(P, device=tokens.device) * L).unsqueeze(0).expand(B, P)
+        prev_ctx = prev_byte_window(tokens, patch_starts, K, self.decoder.BOS).reshape(B * P, K)
 
         z = cond.reshape(B * P, self.cfg.d_model)
         tgt = patches.reshape(B * P, L)
@@ -178,15 +181,81 @@ class HierByteLM(nn.Module):
                 e = self._encode_patches(patches)
                 c = self.global_model(e)
                 cond = c[:, -1]                        # context through last patch
-                last_patch = out[-L:]                  # the just-completed patch
             else:
                 cond = self.start[:, 0]                # [1, d]
-                last_patch = []                         # no previous patch yet
-            ctx = [pad_id] * max(0, K - len(last_patch)) + last_patch[-K:]
+            # trailing K bytes of the stream so far -- spans back across as
+            # many previous patches as needed, not just the last one
+            ctx = [pad_id] * max(0, K - len(out)) + out[-K:]
             prev_ctx = torch.tensor([ctx], dtype=torch.long, device=device)
             gen = self.decoder.generate(cond, torch.tensor([L], device=device), prev_ctx)  # [1,L]
             out.extend(int(b) for b in gen[0].tolist())
         return bytes(b & 0xFF for b in out)
+
+    def _encode_variable(self, patches_list):
+        """patches_list: list[list[int]], P patches of possibly different
+        lengths. Returns e: [1, P, d] (the ragged counterpart of
+        _encode_patches, for a single online generation stream)."""
+        P = len(patches_list)
+        Lmax = max(len(p) for p in patches_list)
+        device = self.start.device
+        buf = torch.zeros(P, Lmax, dtype=torch.long, device=device)
+        lens = torch.zeros(P, dtype=torch.long, device=device)
+        for k, p in enumerate(patches_list):
+            buf[k, :len(p)] = torch.tensor(p, device=device)
+            lens[k] = len(p)
+        e = self.encoder.encode_batch(buf, lens)               # [P, d]
+        return e.view(1, P, self.cfg.d_model)
+
+    @torch.no_grad()
+    def generate_dynamic(self, n_bytes, device, entropy_model, threshold, prompt=b"", Lcap=32):
+        """
+        Autonomous generation for the DYNAMIC (entropy-boundary) model. Patch
+        length isn't fixed like `generate`'s n_patches*L -- after every
+        emitted byte, `entropy_model` (the SAME frozen model and `threshold`
+        boundaries.npz was built from) is asked, online and causally, whether
+        the byte just emitted closes the current patch. This reproduces the
+        offline training-time boundary rule exactly (see dynamic.py's
+        next_byte_entropy/segment_causal), so an already-trained dynamic
+        checkpoint generates autonomously with no retraining.
+        """
+        self.eval()
+        K = self.cfg.byte_ctx_len
+        pad_id = self.decoder.BOS
+
+        closed = segment_causal(entropy_model, list(prompt), threshold, device, Lcap)
+        out = list(prompt)
+        cur_patch = []
+
+        def cond_and_ctx():
+            if closed:
+                e = self._encode_variable(closed)
+                c = self.global_model(e)
+                cond = c[:, -1]                     # context through the last closed patch
+            else:
+                cond = self.start[:, 0]
+            # trailing K bytes of the stream so far -- spans back across as
+            # many previous patches as needed, not just the last closed one
+            ctx = [pad_id] * max(0, K - len(out)) + out[-K:]
+            prev_ctx = torch.tensor([ctx], dtype=torch.long, device=device)
+            return cond, prev_ctx
+
+        cond, prev_ctx = cond_and_ctx()
+        cur, h, z = self.decoder.start_state(cond, prev_ctx)
+
+        while len(out) < n_bytes:
+            nxt, h = self.decoder.step(cur, h, z)
+            b = int(nxt.item())
+            out.append(b); cur_patch.append(b)
+            cur = nxt
+
+            ent = next_byte_entropy(entropy_model, out, device)
+            if ent > threshold or len(cur_patch) >= Lcap:
+                closed.append(cur_patch)
+                cur_patch = []
+                cond, prev_ctx = cond_and_ctx()
+                cur, h, z = self.decoder.start_state(cond, prev_ctx)
+
+        return bytes(x & 0xFF for x in out[:n_bytes])
 
     def num_params(self):
         return sum(p.numel() for p in self.parameters())
@@ -246,13 +315,63 @@ def main():
                    help="path to boundaries.npz -> dynamic entropy patching; empty = fixed")
     p.add_argument("--ckpt_tag", default="",
                    help="checkpoint suffix, e.g. _dyn (keeps the fixed best.pt safe)")
+    p.add_argument("--byte_ctx_len", type=int, default=8,
+                   help="trailing raw-byte window fed to the decoder as cross-patch context "
+                        "(spans back across as many previous patches as needed, not just the "
+                        "last one -- see patcher.prev_byte_window)")
+    p.add_argument("--eval_batches", type=int, default=20,
+                   help="val batches averaged per eval; bump to ~50-100 to shrink eval noise "
+                        "when comparing runs whose gap is close to the per-step noise floor")
     p.add_argument("--entropy_ckpt", default="",
                    help="frozen flat byte model (e.g. entropy_model/best.pt); if set, eval "
                         "also scores it first/within on the SAME boundaries as this run -- "
                         "the real dynamic mask when --boundaries is set (the tax gate), or "
                         "a synthetic stride-patch_len mask when running fixed (the fixed "
                         "first/within baseline) -- so both land in one eval.")
+    p.add_argument("--endogenous", action="store_true",
+                   help="Stage 2: place boundaries via a small BoundaryHead trained jointly "
+                        "instead of a precomputed --boundaries mask; mutually exclusive with "
+                        "--boundaries. Pre-freeze, boundaries are computed live each step from "
+                        "the (still-training) head; at --boundary_freeze_step it stops updating, "
+                        "one real whole-corpus scan runs (reusing precompute_boundaries.py's own "
+                        "compute_surprise/solve_threshold), and the rest of the run collapses "
+                        "into the exact static-mask path --boundaries already uses.")
+    p.add_argument("--boundary_target_len", type=float, default=6.0,
+                   help="mean patch length the boundary head's threshold is calibrated to")
+    p.add_argument("--boundary_freeze_step", type=int, default=None,
+                   help="required with --endogenous. A standalone train_verdict.py + analyze.py "
+                        "sweep on this corpus (small preset, batch_size=32/block_size=128) found "
+                        "the boundary-quality gate passes best around step 1000, then degrades "
+                        "(the same undertraining-signal-loss effect the external entropy model's "
+                        "own design guards against) -- translated to this trainer's default "
+                        "batch_size=16 * (patch_len*patches)=192 byte budget, that's ~1300 steps. "
+                        "Retune if you change --batch_size/--patches/--patch_len.")
+    p.add_argument("--boundary_recalib_interval", type=int, default=200,
+                   help="pre-freeze: refresh the threshold every N steps from a handful of "
+                        "freshly-sampled train batches (cheap; the whole-corpus scan only runs "
+                        "once, at freeze)")
+    p.add_argument("--boundary_calib_batches", type=int, default=20,
+                   help="train batches sampled per threshold recalibration")
+    p.add_argument("--boundary_lr", type=float, default=1e-3,
+                   help="BoundaryHead has its OWN optimizer/clip_grad_norm_, fully separate from "
+                        "the main model's -- folding it into one shared optimizer would let its "
+                        "early-training loss spike distort the main model's gradient-clip norm")
+    p.add_argument("--boundary_d_model", type=int, default=128)
+    p.add_argument("--boundary_depth", type=int, default=4)
+    p.add_argument("--boundary_head_dim", type=int, default=64)
+    p.add_argument("--boundary_window", type=int, default=64)
+    p.add_argument("--boundary_scan_block", type=int, default=1024,
+                   help="freeze-time whole-corpus scan window (precompute_boundaries.py's own "
+                        "default of 4096 can OOM on 8GB GPUs; 1024 is the size this corpus's own "
+                        "boundaries.npz was actually built with)")
+    p.add_argument("--boundary_scan_ctx", type=int, default=256)
+    p.add_argument("--boundary_scan_batch", type=int, default=8)
     args = p.parse_args()
+
+    if args.endogenous:
+        assert not args.boundaries, "--boundaries and --endogenous are mutually exclusive"
+        assert args.boundary_freeze_step is not None, \
+            "--endogenous requires --boundary_freeze_step (see its help for a starting value)"
 
     torch.manual_seed(args.seed)
     device = args.device
@@ -282,18 +401,25 @@ def main():
           f"val {len(val)} ({100*len(val)/len(data):.1f}%)")
 
     DYN = bool(args.boundaries)
+    ENDO = bool(args.endogenous)      # flips DYN True in-place once the boundary head freezes --
+                                      # see the training loop; from then on this run IS a DYN run.
     train_m = val_m = None
     if DYN:
         bnd = load_boundary_mask(args.boundaries, data)      # verifies byte-alignment
         # split bytes AND boundaries in lockstep -- MUST match your byte-split params
-        train, train_m, val, val_m = block_split_with_mask(data, bnd, block=65536, val_every=10)
+        train, train_m, val, val_m = block_split_with_mask(data, bnd, block=block,
+                                                            val_every=args.val_every)
         print(f"dynamic patching: {args.boundaries} "
               f"(corpus mean patch len ~{bnd.numel()/int(bnd.sum()):.2f})")
+    elif ENDO:
+        print(f"endogenous patching: boundary head freezes at step {args.boundary_freeze_step}, "
+              f"target len {args.boundary_target_len}")
 
     print(f"device={device}  bytes={n_bytes}  bytes/char={bytes_per_char:.3f}  "
           f"seq_len={S} ({args.patches} patches x {args.patch_len})")
     cfg = HierConfig(d_model=args.d_model, patch_len=args.patch_len, depth=args.depth,
-                     dropout=args.dropout, window_size=max(16, args.patches))
+                     dropout=args.dropout, window_size=max(16, args.patches),
+                     byte_ctx_len=args.byte_ctx_len)
     model = HierByteLM(cfg).to(device)
     print(f"params={model.num_params()/1e6:.2f}M  (global runs over {args.patches} patches, "
           f"~{args.patch_len}x shorter than {S} bytes)\n")
@@ -321,16 +447,35 @@ def main():
         m = torch.stack([split_m[i:i + S] for i in ix]).to(device)
         return x, m
 
+    boundary_head = bh_opt = None
+    threshold = None
+    frozen = not ENDO       # True whenever there's no boundary head left to freeze
+    if ENDO:
+        bh_cfg = GriffinConfig(vocab_size=256, d_model=args.boundary_d_model,
+                               d_rnn=int(1.5 * args.boundary_d_model), depth=args.boundary_depth,
+                               head_dim=args.boundary_head_dim, window_size=args.boundary_window,
+                               parallel_scan=True, dropout=0.0)
+        boundary_head = Griffin(bh_cfg).to(device)
+        bh_opt = torch.optim.AdamW(boundary_head.parameters(), lr=args.boundary_lr,
+                                   betas=(0.9, 0.95), weight_decay=0.1)
+        print(f"boundary head: {boundary_head.num_params()/1e6:.2f}M params")
+        calib_batches = [get_batch(train) for _ in range(args.boundary_calib_batches)]
+        threshold = recalibrate_threshold(boundary_head, calib_batches, args.boundary_target_len)
+        print(f"initial threshold: {threshold:.3f} bits (target len {args.boundary_target_len})\n")
+
+    def endo_mask(x):
+        return batched_entropy_mask(boundary_head, x, threshold, Lcap=32)
+
     @torch.no_grad()
     def eval_loss():
         model.eval()
         tot = first = within = mlen = 0.0
         ff_bits = ff_n = fw_bits = fw_n = 0.0    # flat model's first/within, bits (same boundaries)
-        for _ in range(20):                      # bump to ~50 for the real comparison
+        for _ in range(args.eval_batches):
             if DYN:
                 x, m = get_batch(val, val_m)
                 p_, pl_, pm_, bm_ = build_ragged(x, m)
-                l, aux = forward_ragged(model, p_, pl_, pm_, bm_)
+                l, aux = forward_ragged(model, x, p_, pl_, pm_, bm_)
                 first += aux["loss_first"].item(); within += aux["loss_within"].item()
                 mlen += aux["mean_patch_len"].item()
                 if flat is not None:
@@ -339,6 +484,15 @@ def main():
                     adj_m = m.clone(); adj_m[:, 0] = True
                     adj_m = cap_patch_lengths(adj_m, Lcap=32)
                     r = flat_first_within(flat, x, adj_m)
+            elif ENDO and not frozen:
+                x = get_batch(val)
+                m = endo_mask(x)
+                p_, pl_, pm_, bm_ = build_ragged(x, m)
+                l, aux = forward_ragged(model, x, p_, pl_, pm_, bm_)
+                first += aux["loss_first"].item(); within += aux["loss_within"].item()
+                mlen += aux["mean_patch_len"].item()
+                if flat is not None:
+                    r = flat_first_within(flat, x, m)
             else:
                 x = get_batch(val)
                 logits, l = model(x)
@@ -358,8 +512,9 @@ def main():
                 fw_bits += r["within_bits"]; fw_n += r["within_n"]
             tot += l.item()
         model.train()
-        out = {"val": tot/20, "hier_first": first/20, "hier_within": within/20,
-               "mean_patch_len": mlen/20}
+        n = args.eval_batches
+        out = {"val": tot/n, "hier_first": first/n, "hier_within": within/n,
+               "mean_patch_len": mlen/n}
         if flat is not None:
             out["flat_first"] = ff_bits / max(ff_n, 1)
             out["flat_within"] = fw_bits / max(fw_n, 1)
@@ -379,11 +534,34 @@ def main():
         start_step = ck.get("step", -1) + 1
         best_val = ck.get("best_val", best_val)
         print(f"resumed from {args.resume} at step {start_step}")
+        if ENDO and "boundary_head" in ck:
+            boundary_head.load_state_dict(ck["boundary_head"])
+            bh_opt.load_state_dict(ck["bh_opt"])
+            threshold = ck["threshold"]
+            frozen = ck["frozen"]
+            if frozen:
+                # re-derive the exact post-freeze masked split from the .npz already written
+                # at freeze time, rather than rerunning the whole-corpus scan
+                bnd = load_boundary_mask(f"boundaries_endo{args.ckpt_tag}.npz", data)
+                train, train_m, val, val_m = block_split_with_mask(data, bnd, block=block,
+                                                                    val_every=args.val_every)
+                DYN = True
+                print(f"resumed post-freeze (threshold {threshold:.3f}); "
+                      f"reloaded boundaries_endo{args.ckpt_tag}.npz")
+            else:
+                print(f"resumed pre-freeze boundary head (threshold {threshold:.3f})")
 
     def save_ckpt(path, step):
-        torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
-                    "cfg": cfg, "step": step, "best_val": best_val,
-                    "bytes_per_char": bytes_per_char}, path)
+        ck = {"model": model.state_dict(), "opt": opt.state_dict(),
+              "cfg": cfg, "step": step, "best_val": best_val,
+              "bytes_per_char": bytes_per_char}
+        if ENDO:
+            ck["boundary_head"] = boundary_head.state_dict()
+            ck["boundary_cfg"] = boundary_head.cfg
+            ck["bh_opt"] = bh_opt.state_dict()
+            ck["threshold"] = threshold
+            ck["frozen"] = frozen
+        torch.save(ck, path)
 
     ln2 = math.log(2)
     model.train()
@@ -391,10 +569,56 @@ def main():
         for g in opt.param_groups:
             g["lr"] = lr_at(step)
 
+        if ENDO and not frozen and step == args.boundary_freeze_step:
+            # Freeze: stop training the boundary head, do ONE real whole-corpus scan (reusing
+            # precompute_boundaries.py's own compute_surprise/solve_threshold), then collapse
+            # into the exact static-mask path --boundaries already uses for the rest of the run.
+            for p_ in boundary_head.parameters():
+                p_.requires_grad_(False)
+            boundary_head.eval()
+            bnd, bmeta = build_boundaries(boundary_head, data, args.boundary_target_len,
+                                          block=args.boundary_scan_block, ctx=args.boundary_scan_ctx,
+                                          batch=args.boundary_scan_batch, device=device)
+            bnd_path = f"boundaries_endo{args.ckpt_tag}.npz"
+            np.savez_compressed(bnd_path, mask=bnd.numpy().astype(np.bool_),
+                                meta=np.array(bmeta, dtype=object))
+            train, train_m, val, val_m = block_split_with_mask(data, bnd, block=block,
+                                                                val_every=args.val_every)
+            DYN = True
+            frozen = True
+            print(f"\nstep {step}: froze boundary head -> {bnd_path} "
+                  f"(mean patch len {bmeta['mean_patch_len']:.2f}, "
+                  f"threshold {bmeta['threshold']:.3f})\n")
+
         if DYN:
             x, m = get_batch(train, train_m)
             p_, pl_, pm_, bm_ = build_ragged(x, m)
-            loss, _ = forward_ragged(model, p_, pl_, pm_, bm_)
+            loss, _ = forward_ragged(model, x, p_, pl_, pm_, bm_)
+        elif ENDO:      # not frozen yet -- boundary head still training, live per-step mask
+            x = get_batch(train)
+            logits_bh = boundary_head(x)
+            V_bh = boundary_head.cfg.vocab_size
+            bh_loss = F.cross_entropy(logits_bh[:, :-1].reshape(-1, V_bh), x[:, 1:].reshape(-1))
+            bh_opt.zero_grad(set_to_none=True)
+            bh_loss.backward()
+            torch.nn.utils.clip_grad_norm_(boundary_head.parameters(), 1.0)
+            bh_opt.step()
+
+            if step % args.boundary_recalib_interval == 0:
+                calib_batches = [get_batch(train) for _ in range(args.boundary_calib_batches)]
+                threshold = recalibrate_threshold(boundary_head, calib_batches,
+                                                  args.boundary_target_len)
+
+            with torch.no_grad():
+                logp = F.log_softmax(logits_bh.detach(), dim=-1)
+                ent = -(logp.exp() * logp).sum(-1) / ln2
+                m = torch.zeros_like(x, dtype=torch.bool)
+                m[:, 0] = True
+                if x.shape[1] > 1:
+                    m[:, 1:] = ent[:, :-1] > threshold
+
+            p_, pl_, pm_, bm_ = build_ragged(x, m)
+            loss, _ = forward_ragged(model, x, p_, pl_, pm_, bm_)
         else:
             _, loss = model(get_batch(train))
 
@@ -433,7 +657,12 @@ def main():
                 best_val = v; save_ckpt(f"best{args.ckpt_tag}.pt", step); flag = "  <- best (saved)"
             vf, vw = m["hier_first"] / ln2, m["hier_within"] / ln2
             extra = f" | hier first {vf:.3f} within {vw:.3f} b/byte"
-            extra += f" | len {m['mean_patch_len']:.2f}" if DYN else f" | len {args.patch_len} (fixed)"
+            if DYN or (ENDO and not frozen):
+                extra += f" | len {m['mean_patch_len']:.2f}"
+                if ENDO and not frozen:
+                    extra += f" | thr {threshold:.2f}"
+            else:
+                extra += f" | len {args.patch_len} (fixed)"
             if "flat_first" in m:
                 ff, fw = m["flat_first"], m["flat_within"]
                 extra += f" | flat first {ff:.3f} within {fw:.3f}"
@@ -444,8 +673,23 @@ def main():
         if args.ckpt_interval and step > 0 and step % args.ckpt_interval == 0:
             save_ckpt(f"last{args.ckpt_tag}.pt", step)
 
-    if DYN:
-        print("\n(dynamic mode: autonomous generation is Stage 2 -- skipping sample.)")
+    if DYN or ENDO:
+        if not all(torch.isfinite(p).all() for p in model.parameters()):
+            print("\n(skipping sample: non-finite weights. Resume from best.pt / last.pt "
+                  "at a lower --lr.)")
+            return
+        if ENDO:
+            # boundary_head/threshold exist from the initial calibration onward, frozen or not
+            state = "frozen" if frozen else "still training, pre-freeze"
+            entropy_model, thr, src = boundary_head, threshold, f"endogenous boundary head, {state}"
+        elif flat is not None:
+            entropy_model, thr, src = flat, load_threshold(args.boundaries), args.entropy_ckpt
+        else:
+            print("\n(dynamic mode: pass --entropy_ckpt to also enable autonomous generation "
+                  "-- it reuses that frozen model + boundaries.npz's threshold online.)")
+            return
+        print(f"\n--- sample (autonomous, dynamic patches, threshold {thr:.2f} bits, {src}) ---")
+        print(repr(model.generate_dynamic(240, device, entropy_model, thr, prompt=b"The ")))
         return
 
     # ------- sample (skip if the run diverged) -------

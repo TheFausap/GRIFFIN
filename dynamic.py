@@ -28,11 +28,15 @@ corrupt real outputs. This is why no explicit masking is needed *inside* the
 global model; masking only the loss suffices.
 """
 
+import math
+
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-from patcher import prev_patch_tail
+from patcher import prev_byte_window
+
+LN2 = math.log(2)
 
 
 # --------------------------------------------------------------------------- #
@@ -155,11 +159,15 @@ def build_ragged(x, m, Lcap=32):
 # --------------------------------------------------------------------------- #
 # ragged forward with masked loss + first-byte / within-patch decomposition
 # --------------------------------------------------------------------------- #
-def forward_ragged(model, patches, plens, pmask, bmask):
+def forward_ragged(model, x, patches, plens, pmask, bmask):
     """
     Runs model.encoder -> model.global_model -> model.decoder over ragged
     patches. Returns (loss, aux) where loss is mean CE per real byte (directly
     comparable to the fixed-patch loss) and aux carries the diagnostic split.
+
+    x : [B, S] long -- the flat byte window `patches`/`plens` were cut from
+        (needed for prev_byte_window's cross-patch context, which spans the
+        raw stream rather than being confined to a single previous patch).
     """
     B, Pmax, Lmax = patches.shape
     d = model.cfg.d_model
@@ -173,7 +181,8 @@ def forward_ragged(model, patches, plens, pmask, bmask):
     cond = torch.cat([model.start.expand(B, 1, -1), c[:, :-1]], dim=1)   # c through k-1
 
     K = model.cfg.byte_ctx_len
-    prev_ctx = prev_patch_tail(patches, plens, K, model.decoder.BOS).reshape(B * Pmax, K)
+    patch_starts = torch.cumsum(plens, dim=1) - plens        # [B, Pmax] exclusive prefix sum
+    prev_ctx = prev_byte_window(x, patch_starts, K, model.decoder.BOS).reshape(B * Pmax, K)
 
     z = cond.reshape(B * Pmax, d)
     tgt = patches.reshape(B * Pmax, Lmax)
@@ -198,3 +207,69 @@ def forward_ragged(model, patches, plens, pmask, bmask):
         "mean_patch_len": (bmask.sum() / pmask.sum().clamp(min=1)).detach(),
     }
     return loss, aux
+
+
+# --------------------------------------------------------------------------- #
+# Online (generation-time) boundary decisions -- Stage 2, option A
+#
+# precompute_boundaries.py places boundaries in one offline, whole-corpus pass:
+# scan every position's next-byte entropy, then pick a single global quantile
+# threshold. Each individual entropy value is already causal (left-context
+# only), so the SAME frozen model + the SAME threshold (stored in
+# boundaries.npz's meta) can be applied one byte at a time as bytes are
+# generated, instead of only over a corpus you already fully have. That's the
+# whole of "option A": no retraining, the training-time boundary rule and the
+# generation-time one are provably the same rule, just applied online vs
+# offline.
+# --------------------------------------------------------------------------- #
+def load_threshold(path):
+    """Read the entropy threshold boundaries.npz was built with (bits)."""
+    z = np.load(path, allow_pickle=True)
+    return float(z["meta"].item()["threshold"])
+
+
+@torch.no_grad()
+def next_byte_entropy(flat_model, seq, device):
+    """
+    seq : list[int] (or 1D tensor), the bytes so far, len >= 1.
+    Returns the entropy (bits) of flat_model's prediction for the byte AFTER
+    seq[-1] -- i.e. surp[len(seq)] in precompute_boundaries.py's convention,
+    the not-yet-known next byte. Brute-force recompute over the whole sequence
+    each call (matches the existing HierByteLM.generate()'s style, which
+    re-encodes all patches from scratch every step too; fine at the lengths a
+    demo sample uses -- Griffin has no incremental/cached-state forward path).
+    """
+    x = torch.as_tensor(list(seq), dtype=torch.long, device=device).unsqueeze(0)
+    logits = flat_model(x)                              # [1, T, V]
+    logp = F.log_softmax(logits[0, -1], dim=-1)
+    return -(logp.exp() * logp).sum().item() / LN2
+
+
+@torch.no_grad()
+def segment_causal(flat_model, byte_ids, threshold, device, Lcap=32):
+    """
+    Boundary-consistent split of KNOWN bytes (e.g. a generation prompt) in one
+    batched entropy pass -- the exact same rule precompute_boundaries.py used
+    (boundary before byte j, j>=1, iff ent[j-1] > threshold; byte 0 always
+    starts a patch), Lcap-capped the same way build_ragged is. Returns
+    list[list[int]] patches. Unlike next_byte_entropy this doesn't need a
+    byte-by-byte loop since every byte is already known.
+    """
+    if not byte_ids:
+        return []
+    T = len(byte_ids)
+    x = torch.tensor([byte_ids], dtype=torch.long, device=device)
+    logits = flat_model(x)                              # [1, T, V]
+    logp = F.log_softmax(logits[0], dim=-1)
+    ent = -(logp.exp() * logp).sum(-1) / LN2            # [T]; ent[t] predicts byte t+1
+
+    mask = torch.zeros(1, T, dtype=torch.bool, device=device)
+    mask[0, 0] = True
+    if T > 1:
+        mask[0, 1:] = ent[:-1] > threshold
+    if Lcap:
+        mask = cap_patch_lengths(mask, Lcap)
+
+    starts = mask[0].nonzero(as_tuple=True)[0].tolist()
+    ends = starts[1:] + [T]
+    return [byte_ids[s:e] for s, e in zip(starts, ends)]

@@ -136,36 +136,36 @@ class PatchEncoder(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
-# Cross-patch byte context: the previous patch's trailing raw bytes
+# Cross-patch byte context: the raw bytes immediately preceding each patch
 # --------------------------------------------------------------------------- #
-def prev_patch_tail(patches, plens, K, pad_id):
+def prev_byte_window(x, patch_starts, K, pad_id):
     """
-    patches : [B, P, Lmax] long byte ids (real bytes at [..., :plens[b,k]]).
-    plens   : [B, P] long, true length of each patch (0 for a pad/absent patch).
-    K       : trailing-context window length.
-    pad_id  : sentinel id for "no byte here" -- pass PatchDecoder.BOS
-              (== vocab_size) so the decoder's existing embedding table covers
-              it with no new table.
+    x            : [B, S] long, the flat byte stream each patch was cut from
+                   (or, at generation time, the bytes emitted/prompted so far).
+    patch_starts : [B, P] long, the byte OFFSET within `x` where each patch
+                   begins (not a patch index) -- e.g. k*patch_len for fixed
+                   patches, or an exclusive cumsum of patch lengths for ragged
+                   ones. Using a byte offset rather than "the previous patch"
+                   means a short patch naturally lets the window spill into
+                   the patch before *that* one too, instead of being capped at
+                   a single patch's content.
+    K            : trailing-context window length.
+    pad_id       : sentinel id for "no byte here" -- pass PatchDecoder.BOS
+                   (== vocab_size) so the decoder's existing embedding table
+                   covers it with no new table.
 
-    Returns [B, P, K] long: the last min(K, plen) real bytes of the PREVIOUS
-    patch (index k-1), right-aligned and left-padded with pad_id. Patch 0 has
-    no previous patch and gets an all-pad_id window -- the same "nothing
-    before this" convention as the learned `start` vector for the global
-    context, so the two conditioning signals agree at a sequence's first patch.
+    Returns [B, P, K] long: the K bytes immediately before each patch's start,
+    left-padded with pad_id past the start of `x`. A patch starting at offset
+    0 gets an all-pad_id window -- the same "nothing before this" convention
+    as the learned `start` vector for the global context.
     """
-    B, P, Lmax = patches.shape
-    device = patches.device
-    prev_patches = torch.cat(
-        [torch.full((B, 1, Lmax), pad_id, dtype=torch.long, device=device), patches[:, :-1]],
-        dim=1)                                                     # [B, P, Lmax]
-    prev_plens = torch.cat(
-        [torch.zeros((B, 1), dtype=torch.long, device=device), plens[:, :-1]], dim=1)   # [B, P]
-
+    B, S = x.shape
+    device = x.device
+    xp = torch.cat([torch.full((B, K), pad_id, dtype=torch.long, device=device), x], dim=1)  # [B, S+K]
+    P = patch_starts.shape[1]
     o = torch.arange(K, device=device).view(1, 1, K)
-    src = prev_plens.unsqueeze(-1) - K + o                          # [B, P, K], may be negative
-    valid = src >= 0
-    gathered = torch.gather(prev_patches, 2, src.clamp(min=0, max=Lmax - 1))
-    return torch.where(valid, gathered, torch.full_like(gathered, pad_id))
+    idx = (patch_starts.unsqueeze(-1) + o).clamp(max=S + K - 1)      # [B, P, K], indices into xp
+    return torch.gather(xp.unsqueeze(1).expand(B, P, S + K), 2, idx)
 
 
 # --------------------------------------------------------------------------- #
@@ -250,6 +250,29 @@ class PatchDecoder(nn.Module):
             cur = nxt
         return torch.cat(outs, dim=1)                     # [P, Lmax]
 
+    @torch.no_grad()
+    def start_state(self, z, prev_ctx=None):
+        """
+        Begin a step-by-step greedy decode of ONE new patch (unknown length --
+        for callers that decide, byte by byte, when the patch is done, e.g. a
+        dynamic-patching generation loop). z: [P,d_model] (P=1 for a single
+        online stream). Returns (cur, h, z_aug) to feed into `step`.
+        """
+        z = self._augment(z, prev_ctx)
+        P = z.shape[0]
+        cur = torch.full((P, 1), self.BOS, dtype=torch.long, device=z.device)
+        return cur, self._h0(z), z
+
+    @torch.no_grad()
+    def step(self, cur, h, z):
+        """One greedy GRU step. cur: [P,1] last byte id (BOS for the first step
+        of a patch). Returns (next_id [P,1], new_h) -- call repeatedly, feeding
+        each returned id back in as `cur`, until the caller's own stopping rule
+        fires (there's no length baked in here, unlike `generate`)."""
+        e = self.in_embed(cur)                            # [P,1,d_byte]
+        y, h = self.gru(torch.cat([e, z.unsqueeze(1)], dim=-1), h)
+        nxt = self.out(y[:, -1]).argmax(-1, keepdim=True)  # [P,1]
+        return nxt, h
 
 
 def load_dump(path):
